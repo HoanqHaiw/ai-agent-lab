@@ -587,8 +587,8 @@ function AnalysisScreen({ apiFetch, workspace, analysisId, draftId, implementati
   </div>;
 }
 
-type VerificationOptions = { manager: string; sandbox_available: boolean; note: string; checks: Array<{ id: string; label: string }> };
-type VerificationResult = { check_id: string; label: string; status: "passed" | "failed"; exit_code: number; output: string };
+type VerificationOptions = { manager: string; sandbox_available: boolean; note: string; checks: Array<{ id: string; label: string; dependency_install?: boolean }>; blocked_checks?: Array<{ label: string; reason: string }> };
+type VerificationResult = { check_id: string; label: string; status: "passed" | "failed"; exit_code: number; output: string; phase?: string };
 
 function VerificationScreen({ apiFetch, workspace, onBack }: { apiFetch: ApiFetch; workspace: Workspace; onBack: () => void }) {
   const [options, setOptions] = useState<VerificationOptions | null>(null);
@@ -610,7 +610,10 @@ function VerificationScreen({ apiFetch, workspace, onBack }: { apiFetch: ApiFetc
   }, [apiBase, apiFetch, workspace.id]);
 
   async function runCheck(check: VerificationOptions["checks"][number]) {
-    if (!window.confirm(`Run “${check.label}” in a disposable Docker container?\n\nSource is mounted read-only, network is disabled, and the container is resource-limited.`)) return;
+    const dependencyNotice = check.dependency_install
+      ? "First, npm downloads locked packages from the public npm registry in a temporary Docker container. Package lifecycle scripts are disabled. This install container has internet access. Then the selected check runs in a separate network-disabled container."
+      : "The selected check runs in a temporary Docker container with networking disabled.";
+    if (!window.confirm(`Run “${check.label}” in Docker?\n\n${dependencyNotice}\n\nOnly a temporary copy is used; it is discarded afterward. Containers have resource limits.`)) return;
     setLoadingId(check.id);
     setError("");
     setResult(null);
@@ -636,9 +639,10 @@ function VerificationScreen({ apiFetch, workspace, onBack }: { apiFetch: ApiFetc
       {options && !options.sandbox_available && <p className="form-error" role="status">Docker is not available to the API host. Checks are disabled; repository commands will not run.</p>}
       {error && <p className="form-error" role="alert">{error}</p>}
       {options?.checks.length ? <div className="project-actions">{options.checks.map((check) => <button className="secondary-button" key={check.id} onClick={() => void runCheck(check)} disabled={!options.sandbox_available || Boolean(loadingId)}>{loadingId === check.id ? "Running…" : check.label}<span>▶</span></button>)}</div> : options && <p className="intelligence-empty">No supported checks were detected from this repository’s manifests.</p>}
+      {options?.blocked_checks?.map((check) => <div className="overview-note" key={`${check.label}:${check.reason}`}><span>!</span> {check.label}: {check.reason}</div>)}
       {result && <div className="overview-note"><span>{result.status === "passed" ? "✓" : "!"}</span> {result.label}: {result.status} (exit {result.exit_code})</div>}
       {result && <pre className="verification-output">{result.output}</pre>}
-      <p className="overview-copy">Dependencies are not installed automatically. A check that needs missing packages will report that in its output.</p>
+      <p className="overview-copy">npm dependencies are prepared only from supported lockfiles, with install scripts disabled. The repository check then runs without network access. Other package managers are not installed automatically.</p>
     </section>
   </>;
 }
