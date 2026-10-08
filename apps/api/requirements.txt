@@ -3,3 +3,4 @@ uvicorn[standard]>=0.34,<1.0
 pydantic-settings>=2.7,<3.0
 python-multipart>=0.0.20,<1.0
 pymongo>=4.13,<5.0
+PyJWT[crypto]>=2.10,<3.0

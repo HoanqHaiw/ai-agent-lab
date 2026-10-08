@@ -11,7 +11,7 @@ from urllib.request import Request, urlopen
 from uuid import UUID
 
 from .project_overview import discover_project_files
-from .workspaces import WORKSPACE_ROOT, WorkspaceError
+from .workspaces import WorkspaceError, active_project_directory, get_workspace
 
 MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
 MAX_CONTEXT_FILES = 10
@@ -138,7 +138,8 @@ async def analyze_task(workspace_id: str, task: str) -> dict[str, Any]:
         safe_id = str(UUID(workspace_id))
     except (ValueError, TypeError, AttributeError) as exc:
         raise WorkspaceError("Workspace not found.", 404) from exc
-    root = WORKSPACE_ROOT / safe_id
+    metadata = await get_workspace(safe_id)
+    root = active_project_directory(safe_id, metadata)
     if not root.is_dir():
         raise WorkspaceError("Workspace not found.", 404)
     contexts, available = _context_files(root, task)

@@ -21,7 +21,8 @@ A developer who has received a task in an unfamiliar or partially familiar codeb
    - Show progress and useful errors (invalid URL/archive, unsupported repository, empty project, provider quota failure).
 3. **Show project overview**
    - Display detected languages/framework hints, top-level structure, and a short repository summary.
-   - Label inferred details as estimates and link them to evidence where possible.
+   - Build a project map from file paths and manifests, with evidence for likely API, database/ORM, and authentication components.
+   - Label static findings as signals rather than verified architecture facts and link them to evidence where possible.
 4. **Submit a handed-off task**
    - User enters the task description.
    - Agent summarizes the request, identifies acceptance criteria it can infer, and asks focused clarification questions where requirements are missing.
@@ -29,9 +30,22 @@ A developer who has received a task in an unfamiliar or partially familiar codeb
    - Retrieve relevant files and snippets from the local index.
    - Return: task understanding, assumptions/open questions, likely impact areas, ordered implementation steps, and verification suggestions.
    - Each codebase claim should cite a repository-relative path and line range when available. Clearly label unsupported hypotheses.
-6. **Review and refine**
-   - User can ask follow-up questions or request a revised plan.
-   - User marks the plan as useful or provides feedback. No code is changed in this phase.
+6. **Review and approve the plan**
+   - Approval is recorded against the saved analysis and remains visible when reopening analysis history.
+   - Approval is the first gate; by itself it does not edit files or execute commands.
+7. **Review and refine**
+   - User can ask repository-specific follow-up questions in Developer Chat; answers cite relevant files and lines when available.
+   - Save recent chat turns alongside workspace metadata so the conversation reopens with its repository.
+   - User can mark the plan as useful or provide feedback.
+   - Save recent analysis results with the workspace so they can be reopened after refreshing the browser.
+8. **Generate and apply an implementation draft**
+   - Only an approved analysis can generate a draft, limited to five files and bounded source context.
+   - Show unified diffs and require a separate explicit confirmation before applying.
+   - Recheck each file's SHA-256 baseline immediately before writing; reject stale drafts if a file changed.
+   - Create an app-managed branch/worktree from the imported snapshot. For ZIP imports, initialize a temporary Git baseline from the safe file inventory.
+   - Apply only to the isolated app-managed worktree, never the user's original local repository. Do not run generated code or commands.
+   - Offer rollback only while the applied file hashes still match; refuse to overwrite any later developer edits.
+   - Store draft source content in the temporary workspace filesystem; persist only draft status and identifiers in workspace metadata.
 
 ## MVP acceptance criteria
 
@@ -39,9 +53,15 @@ A developer who has received a task in an unfamiliar or partially familiar codeb
 - User can see import/analyze progress and recover from common failures.
 - Given a task, the result separates facts supported by repository evidence from assumptions and questions.
 - Relevant file references are clickable or otherwise easy to locate.
+- Project chat answers are grounded in bounded repository snippets and expose validated file citations.
+- Chat history is saved per workspace and limited to the most recent 50 turns.
 - The plan has ordered steps and suggested verification, and can be regenerated after user feedback.
+- An approved plan can produce a bounded diff draft; applying it requires a separate confirmation and rejects stale file baselines.
+- User-triggered lint, test, and syntax checks are selected from a fixed allowlist derived from repository manifests and run in a disposable, resource-limited Docker container with networking disabled and a writable temporary copy of non-sensitive source files.
+- The user can review file paths and diffs before any workspace file is changed.
 - API keys remain server-side; repository contents are not stored in MongoDB.
-- Imported repository code is never executed by the MVP.
+- Recent analysis history is persisted with workspace metadata and can be reopened from the UI.
+- Imported repository code is never executed during import, analysis, chat, or code review. Verification commands run only after a separate explicit user action and only inside the Docker sandbox. Dependencies are not installed automatically.
 
 ## Screen map
 
@@ -69,7 +89,7 @@ Repository import, lightweight indexing, project overview, task analysis, eviden
 
 ### Phase 2 — Controlled implementation
 
-Approval gate, isolated writable worktree, file edits, diff review, explicit command allowlist, test/lint execution in a container, and rollback.
+The demo supports approved plans, bounded drafts, diff review, separate apply confirmation, and stale-file-safe apply/rollback in an app-managed Git branch and worktree. GitHub imports checkpoint their temporary clone; ZIP imports initialize a temporary Git baseline from the safe file inventory. Verification offers only detected npm manifest scripts or built-in Python checks, requires an explicit click, and runs in a disposable Docker container with no network, a temporary source copy, CPU/RAM/process limits, a timeout, and capped output. The temporary copy excludes sensitive files and is discarded after the check. Docker must be installed on the API host; dependency installation is not automatic. The feature has not been end-to-end verified against a live Docker daemon. It does not write to the user's original local repository or remote GitHub.
 
 ### Phase 3 — Git workflow
 
@@ -78,6 +98,10 @@ Branches, commits, GitHub OAuth/private repositories, push, and pull request cre
 ### Phase 4 — Deeper engineering assistance
 
 Project conventions and decision memory, security/performance/test specialists, verification loop, CI integration, and proactive project health reports.
+
+### Phase 5 — User accounts and workspace ownership
+
+Add account registration and sign-in, then associate imported workspaces and analysis history with the authenticated user. Start by evaluating Google OAuth for low-friction sign-in; consider phone-number OTP as an optional method after selecting an SMS provider and documenting its per-message cost and abuse controls. Keep this separate from GitHub repository authorization, which grants access to private source repositories.
 
 ## Decisions to revisit after the MVP demo
 
