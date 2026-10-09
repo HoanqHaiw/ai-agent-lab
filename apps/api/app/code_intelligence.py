@@ -50,7 +50,11 @@ def _review_context(root: Path) -> tuple[list[dict[str, Any]], set[str]]:
             continue
         lines = text.splitlines()
         rendered = "\n".join(f"{index}: {line}" for index, line in enumerate(lines, 1))
-        contexts.append({"path": relative, "line_count": len(lines), "content": rendered[:MAX_CONTEXT_CHARS - total_chars]})
+        rendered = rendered[:MAX_CONTEXT_CHARS - total_chars]
+        visible_line_numbers = re.findall(r"(?m)^(\d+):", rendered)
+        if not visible_line_numbers:
+            continue
+        contexts.append({"path": relative, "line_count": int(visible_line_numbers[-1]), "content": rendered})
         total_chars += len(rendered)
     return contexts, available
 

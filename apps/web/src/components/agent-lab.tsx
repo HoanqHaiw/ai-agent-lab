@@ -6,7 +6,6 @@ import { UserButton, useAuth } from "@clerk/nextjs";
 import Link from "next/link";
 
 type ApiFetch = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
-const clerkClientEnabled = Boolean(process.env.NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY);
 const localApiFetch: ApiFetch = (input, init) => fetch(input, init);
 
 type Workspace = {
@@ -30,8 +29,55 @@ type Workspace = {
     database: { systems: string[]; evidence_files: string[] };
     api: { frameworks: string[]; route_files: string[] };
     authentication: { signals: string[]; evidence_files: string[] };
+    health?: { signals: Array<{ id: string; label: string; status: "detected" | "not_detected"; evidence_files: string[] }>; scope_note: string };
   };
 };
+type WorkspaceApiRecord = {
+  id: string;
+  name: string;
+  source: "GitHub" | "ZIP upload";
+  file_count?: number;
+  files_preview?: string[];
+  project_overview?: Workspace["projectOverview"];
+  analyses?: AnalysisRecord[];
+  chat_messages?: ChatTurn[];
+  code_reviews?: CodeReviewRecord[];
+  implementation_branch?: string;
+};
+
+function isWorkspaceApiRecord(value: unknown): value is WorkspaceApiRecord {
+  if (typeof value !== "object" || value === null) return false;
+  const record = value as Record<string, unknown>;
+  return typeof record.id === "string"
+    && typeof record.name === "string"
+    && (record.source === "GitHub" || record.source === "ZIP upload");
+}
+
+function mapWorkspaceRecord(item: WorkspaceApiRecord): Workspace {
+  return {
+    id: item.id,
+    name: item.name,
+    source: item.source,
+    detail: "saved workspace",
+    fileCount: item.file_count,
+    filesPreview: item.files_preview,
+    projectOverview: item.project_overview,
+    analyses: item.analyses || [],
+    chatMessages: item.chat_messages || [],
+    codeReviews: item.code_reviews || [],
+    implementationBranch: item.implementation_branch,
+  };
+}
+
+function rememberGuestWorkspace(id: string) {
+  try {
+    const saved: unknown = JSON.parse(window.localStorage.getItem("agent-lab.guest-workspace-ids") || "[]");
+    const ids = Array.isArray(saved) ? saved.filter((item): item is string => typeof item === "string") : [];
+    window.localStorage.setItem("agent-lab.guest-workspace-ids", JSON.stringify([id, ...ids.filter((item) => item !== id)].slice(0, 20)));
+  } catch {
+    // The workspace remains usable for this session when browser storage is unavailable.
+  }
+}
 
 type Screen = "home" | "project" | "analysis" | "history" | "chat" | "intelligence" | "verification";
 type ImportSource = "github" | "zip" | null;
@@ -49,11 +95,7 @@ type ChatTurn = { id: string; question: string; answer: string; relevant_files: 
 type CodeReview = { review_summary: string; dependency_notes: string[]; findings: Array<{ category: string; severity: string; title: string; description: string; file: string; start_line: number; end_line: number; recommendation: string }>; files_reviewed: string[]; scope_note: string };
 type CodeReviewRecord = { id: string; created_at: string; result: CodeReview };
 type EvidencePreview = { path: string; content: string; startLine: number; endLine: number };
-
-const initialWorkspaces: Workspace[] = [
-  { id: "storefront-api", name: "storefront-api", source: "GitHub", detail: "updated 2 hours ago" },
-  { id: "task-board", name: "task-board", source: "ZIP upload", detail: "updated yesterday" },
-];
+const emptyWorkspace: Workspace = { id: "", name: "Select a repository", source: "ZIP upload", detail: "no workspace selected" };
 
 const sampleFiles = [
   { name: "src/checkout/checkout.service.ts", kind: "TS", lines: "1–148", reason: "Checkout orchestration and product lookup" },
@@ -67,42 +109,30 @@ const planSteps = [
   { title: "Cover missing and duplicate products", detail: "Add regression cases for unavailable items and repeated product IDs.", tag: "Verification" },
 ];
 
-function workspaceStorageKey(userId: string | null) {
-  return userId ? `agent-lab.workspace-ids.${userId}` : "agent-lab.workspace-ids";
-}
-
-function rememberWorkspace(id: string, userId: string | null) {
-  try {
-    const storageKey = workspaceStorageKey(userId);
-    const saved: unknown = JSON.parse(window.localStorage.getItem(storageKey) || "[]");
-    const ids = Array.isArray(saved) ? saved.filter((item): item is string => typeof item === "string") : [];
-    window.localStorage.setItem(storageKey, JSON.stringify([id, ...ids.filter((item) => item !== id)].slice(0, 20)));
-  } catch {
-    // The workspace remains usable for this session when browser storage is unavailable.
-  }
-}
-
-export default function AgentLab() {
-  return clerkClientEnabled ? <AuthenticatedAgentLab /> : <AgentLabWorkspace apiFetch={localApiFetch} userId={null} accountSlot={null} />;
+export default function AgentLab({ clerkConfigured }: { clerkConfigured: boolean }) {
+  return clerkConfigured
+    ? <AuthenticatedAgentLab />
+    : <AgentLabWorkspace apiFetch={localApiFetch} authenticated={false} accountSlot={null} />;
 }
 
 function AuthenticatedAgentLab() {
-  const { getToken, userId } = useAuth();
+  const { getToken } = useAuth();
   const apiFetch = useCallback<ApiFetch>(async (input, init = {}) => {
     const token = await getToken();
     const headers = new Headers(init.headers);
     if (token) headers.set("Authorization", `Bearer ${token}`);
     return fetch(input, { ...init, headers });
   }, [getToken]);
-  return <AgentLabWorkspace apiFetch={apiFetch} userId={userId || null} accountSlot={<UserButton />} />;
+  return <AgentLabWorkspace apiFetch={apiFetch} authenticated accountSlot={<UserButton />} />;
 }
 
-function AgentLabWorkspace({ apiFetch, userId, accountSlot }: { apiFetch: ApiFetch; userId: string | null; accountSlot: ReactNode }) {
-  const emptyWorkspace: Workspace = { id: "", name: "Select a repository", source: "ZIP upload", detail: "no workspace selected" };
+function AgentLabWorkspace({ apiFetch, authenticated, accountSlot }: { apiFetch: ApiFetch; authenticated: boolean; accountSlot: ReactNode }) {
   const [screen, setScreen] = useState<Screen>("home");
   const [source, setSource] = useState<ImportSource>(null);
-  const [workspaces, setWorkspaces] = useState<Workspace[]>(() => userId ? [] : initialWorkspaces);
-  const [activeWorkspace, setActiveWorkspace] = useState<Workspace>(() => userId ? emptyWorkspace : initialWorkspaces[0]);
+  const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
+  const [activeWorkspace, setActiveWorkspace] = useState<Workspace>(emptyWorkspace);
+  const [workspacesLoading, setWorkspacesLoading] = useState(true);
+  const [workspaceLoadError, setWorkspaceLoadError] = useState("");
   const [repoUrl, setRepoUrl] = useState("");
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [importError, setImportError] = useState("");
@@ -122,42 +152,60 @@ function AgentLabWorkspace({ apiFetch, userId, accountSlot }: { apiFetch: ApiFet
   const [activeTab, setActiveTab] = useState<"plan" | "files">("plan");
 
   useEffect(() => {
-    let savedIds: unknown;
-    try {
-      savedIds = JSON.parse(window.localStorage.getItem(workspaceStorageKey(userId)) || "[]");
-    } catch {
-      return;
-    }
-    if (!Array.isArray(savedIds) || !savedIds.length) return;
+    let cancelled = false;
+    setWorkspacesLoading(true);
+    setWorkspaceLoadError("");
     const apiBase = process.env.NEXT_PUBLIC_API_BASE_URL || "http://localhost:8000";
-    Promise.all(savedIds.filter((id): id is string => typeof id === "string").map(async (id): Promise<Workspace | null> => {
-      try {
-        const response = await apiFetch(`${apiBase}/api/workspaces/${id}`);
-        if (!response.ok) return null;
-        const payload = await response.json();
-        return {
-          id: payload.id,
-          name: payload.name,
-          source: payload.source === "GitHub" ? "GitHub" as const : "ZIP upload" as const,
-          detail: "saved workspace",
-          fileCount: payload.file_count,
-          filesPreview: payload.files_preview,
-          projectOverview: payload.project_overview,
-          analyses: payload.analyses || [],
-          chatMessages: payload.chat_messages || [],
-          codeReviews: payload.code_reviews || [],
-          implementationBranch: payload.implementation_branch,
-        } satisfies Workspace;
-      } catch {
-        return null;
+    async function loadWorkspaces() {
+      if (!authenticated) {
+        let savedIds: unknown;
+        try {
+          savedIds = JSON.parse(window.localStorage.getItem("agent-lab.guest-workspace-ids") || "[]");
+        } catch {
+          throw new Error("Could not read the saved guest workspace list from this browser.");
+        }
+        if (!Array.isArray(savedIds)) throw new Error("The saved guest workspace list is invalid.");
+        const ids = savedIds
+          .filter((id): id is string => typeof id === "string" && /^[0-9a-f-]{36}$/i.test(id))
+          .slice(0, 20);
+        const restored = await Promise.all(ids.map(async (id): Promise<Workspace | null> => {
+          const response = await apiFetch(`${apiBase}/api/workspaces/${id}`);
+          if (response.status === 404 || response.status === 410) return null;
+          const payload: unknown = await response.json();
+          if (!response.ok) throw new Error("Could not restore a saved guest workspace.");
+          if (!isWorkspaceApiRecord(payload)) throw new Error("The API returned an invalid workspace record.");
+          return mapWorkspaceRecord(payload);
+        }));
+        return restored.filter((item): item is Workspace => item !== null);
       }
-    })).then((restored) => {
-      const valid = restored.filter((item): item is Workspace => item !== null);
-      if (!valid.length) return;
-      setWorkspaces(userId ? valid : [...valid, ...initialWorkspaces]);
-      setActiveWorkspace(valid[0]);
-    });
-  }, [apiFetch, userId]);
+
+      const response = await apiFetch(`${apiBase}/api/workspaces`);
+      const payload: unknown = await response.json();
+      if (!response.ok) {
+        const detail = typeof payload === "object" && payload !== null && "detail" in payload
+          ? String(payload.detail)
+          : "Could not load saved workspaces.";
+        throw new Error(detail);
+      }
+      if (!Array.isArray(payload) || !payload.every(isWorkspaceApiRecord)) {
+        throw new Error("The API returned an invalid workspace list.");
+      }
+      return payload.map(mapWorkspaceRecord);
+    }
+    void loadWorkspaces()
+      .then((restored) => {
+        if (cancelled) return;
+        setWorkspaces(restored);
+        setActiveWorkspace(restored[0] || emptyWorkspace);
+      })
+      .catch((cause) => {
+        if (!cancelled) setWorkspaceLoadError(cause instanceof Error ? cause.message : "Could not load saved workspaces.");
+      })
+      .finally(() => {
+        if (!cancelled) setWorkspacesLoading(false);
+      });
+    return () => { cancelled = true; };
+  }, [apiFetch, authenticated]);
 
   function openImport(nextSource: Exclude<ImportSource, null>) {
     setSource(nextSource);
@@ -224,7 +272,7 @@ function AgentLabWorkspace({ apiFetch, userId, accountSlot }: { apiFetch: ApiFet
         codeReviews: payload.code_reviews || [],
       };
       setWorkspaces((items) => [nextWorkspace, ...items]);
-      rememberWorkspace(payload.id, userId);
+      if (!authenticated) rememberGuestWorkspace(payload.id);
       setActiveWorkspace(nextWorkspace);
       setSource(null);
       setScreen("project");
@@ -378,7 +426,8 @@ function AgentLabWorkspace({ apiFetch, userId, accountSlot }: { apiFetch: ApiFet
       <section className="main-panel">
         <header className="topbar"><div className="breadcrumb"><button onClick={() => setScreen("home")}>Workspace</button><span>/</span>{screen === "home" ? "Overview" : screen === "history" ? "Analysis history" : <><button onClick={() => setScreen("project")}>{activeWorkspace.name}</button><span>/</span>{screen === "project" ? "Project overview" : screen === "chat" ? "Developer chat" : screen === "intelligence" ? "Code intelligence" : screen === "verification" ? "Verification" : "Task analysis"}</>}</div><div className="top-actions"><span className="demo-chip"><span className="tiny-dot blue-dot" /> INTERACTIVE PREVIEW</span><button className="help-button" aria-label="Help" onClick={() => showToast("This is a preview with an API-connected analysis flow.")}>?</button></div></header>
         <div className="content">
-          {screen === "home" && <HomeScreen workspaces={workspaces} onImport={openImport} onOpen={openWorkspace} />}
+          {workspaceLoadError && <p className="form-error" role="alert">{workspaceLoadError}</p>}
+          {screen === "home" && <HomeScreen workspaces={workspaces} loading={workspacesLoading} onImport={openImport} onOpen={openWorkspace} />}
           {screen === "project" && <ProjectScreen workspace={activeWorkspace} task={task} onTaskChange={setTask} onAnalyze={startAnalysis} onBack={() => setScreen("home")} onOpenChat={() => setScreen("chat")} onRunReview={() => setScreen("intelligence")} onRunVerification={() => setScreen("verification")} />}
           {screen === "analysis" && <AnalysisScreen apiFetch={apiFetch} workspace={activeWorkspace} analysisId={analysisRecordId} draftId={implementationDraftId} implementationStatus={implementationStatus} onDraftCreated={rememberImplementationDraft} onImplementationChanged={updateImplementationState} task={analysisTask} result={analysisResult} error={analysisError} loading={analysisLoading} approved={approved} approvalLoading={approvalLoading} approvalError={approvalError} activeTab={activeTab} onTab={setActiveTab} onApprove={() => void approveCurrentPlan()} onBack={() => setScreen("project")} />}
           {screen === "chat" && <ChatScreen key={activeWorkspace.id} apiFetch={apiFetch} workspace={activeWorkspace} onBack={() => setScreen("project")} onMessagesChanged={(messages) => updateChatMessages(activeWorkspace.id, messages)} />}
@@ -394,7 +443,7 @@ function AgentLabWorkspace({ apiFetch, userId, accountSlot }: { apiFetch: ApiFet
   );
 }
 
-function HomeScreen({ workspaces, onImport, onOpen }: { workspaces: Workspace[]; onImport: (source: Exclude<ImportSource, null>) => void; onOpen: (workspace: Workspace) => void }) {
+function HomeScreen({ workspaces, loading, onImport, onOpen }: { workspaces: Workspace[]; loading: boolean; onImport: (source: Exclude<ImportSource, null>) => void; onOpen: (workspace: Workspace) => void }) {
   return <>
     <div className="welcome-row"><div><div className="eyebrow"><span className="eyebrow-line" /> YOUR ENGINEERING COPILOT</div><h1>Understand the task.<br /><span>Then write the code.</span></h1><p className="intro">Give Agent Lab a repository and a handoff. Get a clear, evidence-backed plan before implementation begins.</p></div><div className="hero-orbit" aria-hidden="true"><div className="orbit orbit-one" /><div className="orbit orbit-two" /><div className="orbit-core">✳</div><span className="orbit-node node-a">⌘</span><span className="orbit-node node-b">{ }</span><span className="orbit-node node-c">↗</span></div></div>
     <div className="section-heading"><div><h2>Start with a repository</h2><p>Choose where your project lives. Both options lead to the same analysis flow.</p></div><span className="step-pill"><span>01</span> CREATE WORKSPACE</span></div>
@@ -403,7 +452,7 @@ function HomeScreen({ workspaces, onImport, onOpen }: { workspaces: Workspace[];
       <button className="source-card" type="button" onClick={() => onImport("zip")}><span className="source-icon upload-icon"><UploadIcon /></span><span className="source-copy"><strong>Upload a project</strong><span>Bring a local project as a ZIP file</span></span><span className="source-arrow">↗</span><span className="source-foot"><span className="tiny-dot blue-dot" /> ZIP files up to 50 MB</span></button>
     </div>
     <div className="how-row"><div className="how-icon">✦</div><div><strong>From handoff to a confident plan</strong><span>Agent Lab maps your code, traces the task to relevant files, and shows its evidence.</span></div><a href="#how-it-works">How the demo works <span>→</span></a></div>
-    <section className="recent-section"><div className="section-heading recent-heading"><div><h2>Recent workspaces</h2><p>Pick up where you left off.</p></div><button className="view-all" onClick={() => onImport("github")}>New workspace <span>＋</span></button></div><div className="workspace-list">{workspaces.map((workspace, index) => <button className="workspace-row" onClick={() => onOpen(workspace)} key={workspace.id}><span className={`repo-avatar ${index % 2 ? "blue" : "violet"}`}>{workspace.name.slice(0, 2).toUpperCase()}</span><span className="repo-info"><strong>{workspace.name}</strong><small>{workspace.source} · {workspace.detail}</small></span><span className="repo-status"><span className="tiny-dot green" /> Ready</span><span className="row-arrow">→</span></button>)}</div></section>
+    <section className="recent-section"><div className="section-heading recent-heading"><div><h2>Recent workspaces</h2><p>Pick up where you left off.</p></div><button className="view-all" onClick={() => onImport("github")}>New workspace <span>＋</span></button></div><div className="workspace-list">{loading ? <p className="intelligence-empty">Loading saved workspaces…</p> : workspaces.length ? workspaces.map((workspace, index) => <button className="workspace-row" onClick={() => onOpen(workspace)} key={workspace.id}><span className={`repo-avatar ${index % 2 ? "blue" : "violet"}`}>{workspace.name.slice(0, 2).toUpperCase()}</span><span className="repo-info"><strong>{workspace.name}</strong><small>{workspace.source} · {workspace.detail}</small></span><span className="repo-status"><span className="tiny-dot green" /> Ready</span><span className="row-arrow">→</span></button>) : <p className="intelligence-empty">No saved workspaces yet. Import a repository to get started.</p>}</div></section>
     <footer><span>BUILT FOR THE MOMENT BEFORE THE FIRST COMMIT</span><span>Agent Lab <b>·</b> Interactive preview</span></footer>
   </>;
 }
@@ -434,6 +483,7 @@ function ProjectScreen({ workspace, task, onTaskChange, onAnalyze, onBack, onOpe
         <article className="intelligence-card"><h3>Architecture &amp; project map</h3><p className="intelligence-summary">{workspace.projectOverview.architecture.style}</p>{workspace.projectOverview.architecture.project_map.length ? workspace.projectOverview.architecture.project_map.map((layer) => <div className="intelligence-row" key={layer.name}><strong>{layer.name}</strong><span>{layer.file_count} files</span><small>{layer.evidence_files.slice(0, 2).join(" · ")}</small></div>) : <p className="intelligence-empty">No recognizable layers found in paths.</p>}</article>
         <article className="intelligence-card"><h3>API &amp; database</h3><div className="intelligence-pair"><strong>API frameworks</strong><span>{workspace.projectOverview.api.frameworks.join(", ") || "No framework signal found"}</span></div><div className="intelligence-evidence">{workspace.projectOverview.api.route_files.slice(0, 5).map((path) => <code key={path}>{path}</code>)}</div><div className="intelligence-pair"><strong>Database / ORM signals</strong><span>{workspace.projectOverview.database.systems.join(", ") || "No database signal found"}</span></div><div className="intelligence-evidence">{workspace.projectOverview.database.evidence_files.slice(0, 5).map((path) => <code key={path}>{path}</code>)}</div></article>
         <article className="intelligence-card"><h3>Authentication</h3><p className="intelligence-summary">{workspace.projectOverview.authentication.signals.join(", ") || "No authentication signal found"}</p>{workspace.projectOverview.authentication.evidence_files.length ? <div className="intelligence-evidence">{workspace.projectOverview.authentication.evidence_files.slice(0, 8).map((path) => <code key={path}>{path}</code>)}</div> : <p className="intelligence-empty">This is a static scan; absence of signals does not prove authentication is missing.</p>}</article>
+        {workspace.projectOverview.health && <article className="intelligence-card"><h3>Project health signals</h3><p className="intelligence-summary">Repository file indicators, not a quality score.</p>{workspace.projectOverview.health.signals.map((signal) => <div className="intelligence-row" key={signal.id}><strong>{signal.label}</strong><span>{signal.status === "detected" ? "Evidence found" : "Not detected"}</span><small>{signal.evidence_files.join(" · ") || "No matching files in the static scan."}</small></div>)}<p className="intelligence-empty">{workspace.projectOverview.health.scope_note}</p></article>}
       </div>
       <p className="intelligence-disclaimer">These are repository indicators, not a full architecture audit. Confirm each finding in its cited files.</p>
     </section>}
@@ -495,7 +545,11 @@ function AnalysisScreen({ apiFetch, workspace, analysisId, draftId, implementati
     setDraftError("");
     setApplyLoading(true);
     try {
-      const response = await apiFetch(`${apiBase}/api/workspaces/${workspace.id}/tasks/implementation-drafts/${draft.id}/apply`, { method: "POST" });
+      const response = await apiFetch(`${apiBase}/api/workspaces/${workspace.id}/tasks/implementation-drafts/${draft.id}/apply`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ confirmed: true }),
+      });
       const payload = await response.json();
       if (!response.ok) {
         if (response.status === 409) setDraft({ ...draft, status: "stale" });
@@ -517,7 +571,11 @@ function AnalysisScreen({ apiFetch, workspace, analysisId, draftId, implementati
     setDraftError("");
     setRollbackLoading(true);
     try {
-      const response = await apiFetch(`${apiBase}/api/workspaces/${workspace.id}/tasks/implementation-drafts/${draft.id}/rollback`, { method: "POST" });
+      const response = await apiFetch(`${apiBase}/api/workspaces/${workspace.id}/tasks/implementation-drafts/${draft.id}/rollback`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ confirmed: true }),
+      });
       const payload = await response.json();
       if (!response.ok) throw new Error(payload.detail || "Could not revert implementation changes.");
       setDraft({ ...draft, status: "reverted" });
@@ -587,7 +645,7 @@ function AnalysisScreen({ apiFetch, workspace, analysisId, draftId, implementati
   </div>;
 }
 
-type VerificationOptions = { manager: string; sandbox_available: boolean; note: string; checks: Array<{ id: string; label: string; dependency_install?: boolean }>; blocked_checks?: Array<{ label: string; reason: string }> };
+type VerificationOptions = { manager: string; status: "ready" | "blocked" | "unsupported"; sandbox_available: boolean; sandbox_reason?: string | null; note: string; checks: Array<{ id: string; label: string; dependency_install?: boolean }>; blocked_checks?: Array<{ label: string; reason: string }> };
 type VerificationResult = { check_id: string; label: string; status: "passed" | "failed"; exit_code: number; output: string; phase?: string };
 
 function VerificationScreen({ apiFetch, workspace, onBack }: { apiFetch: ApiFetch; workspace: Workspace; onBack: () => void }) {
@@ -611,7 +669,7 @@ function VerificationScreen({ apiFetch, workspace, onBack }: { apiFetch: ApiFetc
 
   async function runCheck(check: VerificationOptions["checks"][number]) {
     const dependencyNotice = check.dependency_install
-      ? "First, npm downloads locked packages from the public npm registry in a temporary Docker container. Package lifecycle scripts are disabled. This install container has internet access. Then the selected check runs in a separate network-disabled container."
+      ? "First, npm downloads locked packages in a temporary Docker container with lifecycle scripts disabled. The API must explicitly allow dependency network access; when enabled, Docker bridge egress is not restricted to a hostname. Then the selected check runs in a separate network-disabled container."
       : "The selected check runs in a temporary Docker container with networking disabled.";
     if (!window.confirm(`Run “${check.label}” in Docker?\n\n${dependencyNotice}\n\nOnly a temporary copy is used; it is discarded afterward. Containers have resource limits.`)) return;
     setLoadingId(check.id);
@@ -636,13 +694,13 @@ function VerificationScreen({ apiFetch, workspace, onBack }: { apiFetch: ApiFetc
     <div className="intelligence-title-row"><div><div className="eyebrow"><span className="eyebrow-line" /> TESTING ENGINE</div><h1 className="screen-title">Verify {workspace.name}</h1><p className="screen-subtitle">Only manifest-declared checks from a fixed allowlist are offered.</p></div></div>
     <section className="panel-card"><div className="panel-heading"><div><h2>Available checks</h2><p>Detected project type: {options?.manager || "scanning…"}</p></div><span className="demo-label">DOCKER SANDBOX</span></div>
       <p className="overview-copy">{options?.note || "Inspecting repository manifests…"}</p>
-      {options && !options.sandbox_available && <p className="form-error" role="status">Docker is not available to the API host. Checks are disabled; repository commands will not run.</p>}
+      {options && !options.sandbox_available && <p className="form-error" role="status">{options.sandbox_reason || "Docker is not available to the API host."} Checks are disabled; repository commands will not run.</p>}
       {error && <p className="form-error" role="alert">{error}</p>}
-      {options?.checks.length ? <div className="project-actions">{options.checks.map((check) => <button className="secondary-button" key={check.id} onClick={() => void runCheck(check)} disabled={!options.sandbox_available || Boolean(loadingId)}>{loadingId === check.id ? "Running…" : check.label}<span>▶</span></button>)}</div> : options && <p className="intelligence-empty">No supported checks were detected from this repository’s manifests.</p>}
+      {options?.checks.length ? <div className="project-actions">{options.checks.map((check) => <button className="secondary-button" key={check.id} onClick={() => void runCheck(check)} disabled={!options.sandbox_available || Boolean(loadingId)}>{loadingId === check.id ? "Running…" : check.label}<span>▶</span></button>)}</div> : options?.status === "blocked" ? <p className="form-error" role="status">Detected checks are blocked by package-manager or dependency safety policy. See the specific reasons below.</p> : options && <p className="intelligence-empty">No supported checks were detected from this repository’s manifests.</p>}
       {options?.blocked_checks?.map((check) => <div className="overview-note" key={`${check.label}:${check.reason}`}><span>!</span> {check.label}: {check.reason}</div>)}
       {result && <div className="overview-note"><span>{result.status === "passed" ? "✓" : "!"}</span> {result.label}: {result.status} (exit {result.exit_code})</div>}
       {result && <pre className="verification-output">{result.output}</pre>}
-      <p className="overview-copy">npm dependencies are prepared only from supported lockfiles, with install scripts disabled. The repository check then runs without network access. Other package managers are not installed automatically.</p>
+      <p className="overview-copy">npm is the only package manager whose locked dependency preparation is currently supported. pnpm, Yarn, and Bun manifests are identified and blocked with a reason rather than being run as npm. Repository checks run without network access.</p>
     </section>
   </>;
 }

@@ -22,6 +22,7 @@ A developer who has received a task in an unfamiliar or partially familiar codeb
 3. **Show project overview**
    - Display detected languages/framework hints, top-level structure, and a short repository summary.
    - Build a project map from file paths and manifests, with evidence for likely API, database/ORM, and authentication components.
+   - Show deterministic project-health signals for test files, CI, container/deployment configuration, docs, and dependency lockfiles. These are file-presence indicators, not quality, security, or coverage scores.
    - Label static findings as signals rather than verified architecture facts and link them to evidence where possible.
 4. **Submit a handed-off task**
    - User enters the task description.
@@ -57,11 +58,11 @@ A developer who has received a task in an unfamiliar or partially familiar codeb
 - Chat history is saved per workspace and limited to the most recent 50 turns.
 - The plan has ordered steps and suggested verification, and can be regenerated after user feedback.
 - An approved plan can produce a bounded diff draft; applying it requires a separate confirmation and rejects stale file baselines.
-- User-triggered lint, test, and syntax checks are selected from a fixed allowlist derived from repository manifests and run in a disposable, resource-limited Docker container with networking disabled and a writable temporary copy of non-sensitive source files.
+- User-triggered checks are selected from manifest-declared npm scripts or built-in Python checks and run in a disposable, resource-limited Docker container. The check phase has networking disabled; dependency installation is supported only for validated npm lockfiles and is blocked by default unless the API operator explicitly enables Docker bridge networking.
 - The user can review file paths and diffs before any workspace file is changed.
 - API keys remain server-side; repository contents are not stored in MongoDB.
 - Recent analysis history is persisted with workspace metadata and can be reopened from the UI.
-- Imported repository code is never executed during import, analysis, chat, or code review. Verification commands run only after a separate explicit user action and only inside the Docker sandbox. Dependencies are not installed automatically.
+- Imported repository code is never executed during import, analysis, chat, or code review. Verification commands run only after a separate explicit user action and only inside the Docker sandbox. Dependency installation is blocked by default; npm install is available only for validated lockfiles when the API operator explicitly enables the dependency-network setting. Install lifecycle scripts are disabled, and the selected check runs in a separate network-disabled container.
 
 ## Screen map
 
@@ -69,7 +70,7 @@ A developer who has received a task in an unfamiliar or partially familiar codeb
 2. **Import and analysis status** — progress, current stage, and actionable errors.
 3. **Project overview** — repository summary and structure.
 4. **Task analysis** — task input, agent response, evidence references, clarification questions, and plan.
-5. **Settings (minimal)** — provider status and demo configuration state; never display secret values.
+5. **Settings** — planned; provider status and demo configuration state should never display secret values.
 
 ## Technical boundaries for the first release
 
@@ -79,7 +80,7 @@ A developer who has received a task in an unfamiliar or partially familiar codeb
 - Start with public GitHub repositories and ZIP upload; do not build GitHub OAuth until private-repository access is required.
 - Use a provider interface so Gemini can be swapped without coupling product logic to one SDK.
 - Use deterministic file discovery and retrieval before considering embeddings/vector databases.
-- No autonomous editing, shell commands, test execution, commit, push, PR creation, multi-agent routing, or self-learning in MVP.
+- No autonomous editing or general-purpose shell tool, commit, push, PR creation, multi-agent routing, or self-learning in MVP. User-triggered verification is the narrow, sandboxed exception.
 
 ## Expansion roadmap
 
@@ -89,7 +90,7 @@ Repository import, lightweight indexing, project overview, task analysis, eviden
 
 ### Phase 2 — Controlled implementation
 
-The demo supports approved plans, bounded drafts, diff review, separate apply confirmation, and stale-file-safe apply/rollback in an app-managed Git branch and worktree. GitHub imports checkpoint their temporary clone; ZIP imports initialize a temporary Git baseline from the safe file inventory. Verification offers only detected npm manifest scripts or built-in Python checks and requires an explicit click. For npm checks, a supported lockfile is required when dependencies are declared; lockfile sources must resolve to the public npm registry. Dependency preparation happens in a disposable Docker container with internet access, npm lifecycle scripts disabled, and npm configured for `registry.npmjs.org`. The selected check runs afterward in a separate network-disabled container. Both stages use a temporary copy with CPU/RAM/process limits, a timeout, and capped output, and the copy is discarded afterward. Docker must be installed on the API host. The feature has not been end-to-end verified against a live Docker daemon. It does not write to the user's original local repository or remote GitHub.
+The demo supports approved plans, bounded drafts, diff review, separate apply confirmation, and stale-file-safe apply/rollback in an app-managed Git branch and worktree. GitHub imports checkpoint their temporary clone; ZIP imports initialize a temporary Git baseline from the safe file inventory. Verification requires an explicit click. npm workspace scripts are associated with the nearest declared workspace root, and each command runs in its package directory. Python source can receive a syntax check; Python test suites are shown as blocked until a safe dependency-preparation workflow is implemented. npm lockfile versions 1–3 are checked for registry-only dependency URLs; dependency installation is blocked unless the API operator explicitly sets `VERIFICATION_ALLOW_DEPENDENCY_NETWORK=true`. That setting permits Docker bridge egress without hostname enforcement, so leave it off for untrusted repositories. npm lifecycle scripts are disabled; selected checks run in a separate network-disabled container. The temporary copy has CPU/RAM/process limits, a timeout, and capped output, and is discarded afterward. pnpm, Yarn, and Bun are identified but blocked because safe locked installation is not yet implemented. Docker must be installed and its daemon reachable by the API host. The check engine has profile unit tests; live container execution remains unverified against a Docker daemon. It does not write to the user's original local repository or remote GitHub.
 
 ### Phase 3 — Git workflow
 
@@ -97,11 +98,11 @@ Branches, commits, GitHub OAuth/private repositories, push, and pull request cre
 
 ### Phase 4 — Deeper engineering assistance
 
-Project conventions and decision memory, security/performance/test specialists, verification loop, CI integration, and proactive project health reports.
+Project conventions and decision memory, security/performance/test specialists, verification loop, CI result integration in the app, and proactive project health reports. A basic GitHub Actions workflow already runs API and web checks; the app does not yet read or display those workflow results.
 
 ### Phase 5 — User accounts and workspace ownership
 
-Add account registration and sign-in, then associate imported workspaces and analysis history with the authenticated user. Start by evaluating Google OAuth for low-friction sign-in; consider phone-number OTP as an optional method after selecting an SMS provider and documenting its per-message cost and abuse controls. Keep this separate from GitHub repository authorization, which grants access to private source repositories.
+Clerk sign-in/register and API token/owner checks are scaffolded. Enable Google in the Clerk dashboard and configure both web/API secrets before account flows are active. Existing guest workspaces are not transferred to user accounts. Phone-number OTP is not implemented; defer it until an SMS provider and cost/abuse controls are chosen. Keep sign-in separate from GitHub repository authorization, which grants access to private source repositories.
 
 ## Decisions to revisit after the MVP demo
 

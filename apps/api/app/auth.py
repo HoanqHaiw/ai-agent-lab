@@ -41,7 +41,11 @@ async def get_current_user_id(authorization: Annotated[str | None, Header()] = N
 
     authorized_party = claims.get("azp")
     web_origin = os.environ.get("WEB_ORIGIN", "http://localhost:3000").strip().rstrip("/")
-    allowed_origins = {origin.strip().rstrip("/") for origin in os.environ.get("AUTHORIZED_PARTIES", web_origin).split(",") if origin.strip()}
-    if authorized_party and allowed_origins and authorized_party.rstrip("/") not in allowed_origins:
+    configured_origins = os.environ.get("AUTHORIZED_PARTIES", "").strip() or web_origin
+    allowed_origins = {origin.strip().rstrip("/") for origin in configured_origins.split(",") if origin.strip()}
+    if allowed_origins and (
+        not isinstance(authorized_party, str)
+        or authorized_party.rstrip("/") not in allowed_origins
+    ):
         raise HTTPException(status_code=401, detail="The session token was issued to an untrusted application origin.")
     return str(claims["sub"])

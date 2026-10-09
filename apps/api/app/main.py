@@ -10,7 +10,7 @@ from pydantic import BaseModel
 
 load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 
-from .workspaces import WorkspaceError, approve_workspace_analysis, create_workspace_from_github, create_workspace_from_zip, ensure_workspace_owner, get_workspace, read_workspace_file, remove_expired_workspaces, save_workspace_analysis, save_workspace_chat_turn, save_workspace_code_review
+from .workspaces import WorkspaceError, approve_workspace_analysis, create_workspace_from_github, create_workspace_from_zip, ensure_workspace_owner, get_workspace, list_workspaces, read_workspace_file, remove_expired_workspaces, save_workspace_analysis, save_workspace_chat_turn, save_workspace_code_review
 from .task_analysis import analyze_task
 from .developer_chat import answer_project_question
 from .code_intelligence import review_workspace
@@ -68,6 +68,14 @@ async def health() -> dict[str, str]:
     return {"status": "ok", "service": "ai-agent-lab-api"}
 
 
+@app.get("/api/workspaces")
+async def workspace_list(user_id: str | None = Depends(get_current_user_id)) -> list[dict]:
+    try:
+        return await list_workspaces(user_id)
+    except WorkspaceError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+
+
 @app.post("/api/workspaces/import-zip", status_code=201)
 async def import_zip(file: UploadFile = File(...), user_id: str | None = Depends(get_current_user_id)) -> JSONResponse:
     if not file.filename or not file.filename.lower().endswith(".zip"):
@@ -91,6 +99,10 @@ class TaskAnalysisRequest(BaseModel):
 
 class ProjectChatRequest(BaseModel):
     message: str
+
+
+class ConfirmationRequest(BaseModel):
+    confirmed: bool = False
 
 
 @app.get("/api/workspaces/{workspace_id}/files")
@@ -144,7 +156,9 @@ async def read_implementation_draft(workspace_id: str, draft_id: str, user_id: s
 
 
 @app.post("/api/workspaces/{workspace_id}/tasks/implementation-drafts/{draft_id}/apply")
-async def apply_workspace_implementation(workspace_id: str, draft_id: str, user_id: str | None = Depends(get_current_user_id)) -> dict:
+async def apply_workspace_implementation(workspace_id: str, draft_id: str, request: ConfirmationRequest, user_id: str | None = Depends(get_current_user_id)) -> dict:
+    if not request.confirmed:
+        raise HTTPException(status_code=409, detail="Explicit confirmation is required before applying this draft.")
     try:
         ensure_workspace_owner(await get_workspace(workspace_id), user_id)
         return await apply_implementation_draft(workspace_id, draft_id)
@@ -153,7 +167,9 @@ async def apply_workspace_implementation(workspace_id: str, draft_id: str, user_
 
 
 @app.post("/api/workspaces/{workspace_id}/tasks/implementation-drafts/{draft_id}/rollback")
-async def rollback_workspace_implementation(workspace_id: str, draft_id: str, user_id: str | None = Depends(get_current_user_id)) -> dict:
+async def rollback_workspace_implementation(workspace_id: str, draft_id: str, request: ConfirmationRequest, user_id: str | None = Depends(get_current_user_id)) -> dict:
+    if not request.confirmed:
+        raise HTTPException(status_code=409, detail="Explicit confirmation is required before rolling back this draft.")
     try:
         ensure_workspace_owner(await get_workspace(workspace_id), user_id)
         return await rollback_implementation_draft(workspace_id, draft_id)

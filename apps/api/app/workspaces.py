@@ -17,12 +17,13 @@ from urllib.parse import urlsplit
 from zipfile import BadZipFile, ZipFile, ZipInfo
 
 from fastapi import UploadFile
-from .project_overview import analyze_project, discover_project_files, is_sensitive_project_file
+from .project_overview import PROJECT_OVERVIEW_VERSION, analyze_project, discover_project_files, is_sensitive_project_file
 
 MAX_UPLOAD_BYTES = 50 * 1024 * 1024
 MAX_EXTRACTED_BYTES = 200 * 1024 * 1024
 MAX_ARCHIVE_ENTRIES = 10_000
 RETENTION_DAYS = 7
+MAX_WORKSPACE_LIST = 100
 CHUNK_SIZE = 1024 * 1024
 IGNORED_PARTS = {
     ".git", "node_modules", "dist", "build", ".next", ".venv", "venv",
@@ -209,7 +210,7 @@ async def create_workspace_from_zip(upload: UploadFile, owner_id: str | None = N
             "file_count": len(extracted_files),
             "files_preview": extracted_files[:100],
             "project_overview": analyze_project(directory, extracted_files),
-            "project_overview_version": 2,
+            "project_overview_version": PROJECT_OVERVIEW_VERSION,
             "analyses": [],
             "created_at": created_at.isoformat(),
             "expires_at": expires_at.isoformat(),
@@ -340,7 +341,7 @@ async def create_workspace_from_github(repo_url: str, owner_id: str | None = Non
             "file_count": len(files),
             "files_preview": files[:100],
             "project_overview": analyze_project(directory, files),
-            "project_overview_version": 2,
+            "project_overview_version": PROJECT_OVERVIEW_VERSION,
             "analyses": [],
             "created_at": created_at.isoformat(),
             "expires_at": (created_at + timedelta(days=RETENTION_DAYS)).isoformat(),
@@ -372,17 +373,106 @@ async def get_workspace(value: str) -> dict[str, Any]:
         shutil.rmtree(WORKSPACE_ROOT / ".agent-lab-worktrees" / workspace_id, ignore_errors=True)
         raise WorkspaceError("This workspace has expired. Import the project again to continue.", 410)
     project_directory = active_project_directory(workspace_id, metadata)
-    if metadata.get("project_overview_version") != 2:
+    if metadata.get("project_overview_version") != PROJECT_OVERVIEW_VERSION:
         files = discover_project_files(project_directory)
         metadata["file_count"] = len(files)
         metadata["files_preview"] = files[:100]
         metadata["project_overview"] = analyze_project(project_directory, files)
-        metadata["project_overview_version"] = 2
+        metadata["project_overview_version"] = PROJECT_OVERVIEW_VERSION
         await _persist_metadata(metadata, directory)
     if "analyses" not in metadata:
         metadata["analyses"] = []
         await _persist_metadata(metadata, directory)
     return metadata
+
+
+def _workspace_listing_record(metadata: dict[str, Any]) -> dict[str, Any] | None:
+    if (
+        not isinstance(metadata.get("id"), str)
+        or not isinstance(metadata.get("name"), str)
+        or metadata.get("source") not in {"GitHub", "ZIP upload"}
+    ):
+        return None
+    try:
+        if str(UUID(metadata["id"])) != metadata["id"]:
+            return None
+    except ValueError:
+        return None
+    try:
+        expires_at = datetime.fromisoformat(metadata["expires_at"])
+        created_at = datetime.fromisoformat(metadata["created_at"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=timezone.utc)
+    if created_at.tzinfo is None:
+        created_at = created_at.replace(tzinfo=timezone.utc)
+    if expires_at <= datetime.now(timezone.utc):
+        return None
+    fields = (
+        "id", "name", "source", "status", "file_count", "files_preview",
+        "project_overview", "analyses", "chat_messages", "code_reviews",
+        "implementation_branch", "created_at", "expires_at",
+    )
+    record = {field: metadata[field] for field in fields if field in metadata}
+    record["created_at"] = created_at.astimezone(timezone.utc).isoformat()
+    record["expires_at"] = expires_at.astimezone(timezone.utc).isoformat()
+    return record
+
+
+async def list_workspaces(owner_id: str | None) -> list[dict[str, Any]]:
+    if owner_id is None:
+        return []
+    mongo_uri = os.environ.get("MONGODB_URI")
+    if mongo_uri:
+        try:
+            from pymongo import AsyncMongoClient
+
+            client = AsyncMongoClient(mongo_uri, serverSelectionTimeoutMS=4000)
+            try:
+                database_name = os.environ.get("MONGODB_DATABASE") or "agent_lab"
+                collection = client[database_name].workspaces
+                cursor = (
+                    collection.find({
+                        "owner_id": owner_id,
+                        "expires_at": {"$gt": datetime.now(timezone.utc).isoformat()},
+                    })
+                    .sort("created_at", -1)
+                    .limit(MAX_WORKSPACE_LIST)
+                )
+                records = await cursor.to_list(length=MAX_WORKSPACE_LIST)
+            finally:
+                await client.close()
+        except Exception as exc:
+            raise WorkspaceError("Could not list workspaces from MongoDB. Check MONGODB_URI and Atlas network access.", 503) from exc
+    else:
+        records = []
+        directories = []
+        for directory in WORKSPACE_ROOT.iterdir():
+            if directory.is_symlink() or not directory.is_dir() or not re.fullmatch(r"[0-9a-f-]{36}", directory.name):
+                continue
+            try:
+                modified_at = directory.stat().st_mtime
+            except OSError:
+                continue
+            directories.append((modified_at, directory))
+        directories.sort(key=lambda item: item[0], reverse=True)
+        for _, directory in directories[:MAX_WORKSPACE_LIST * 5]:
+            metadata = await _read_metadata(directory.name, directory)
+            if (
+                isinstance(metadata, dict)
+                and metadata.get("id") == directory.name
+                and metadata.get("owner_id") == owner_id
+            ):
+                records.append(metadata)
+
+    listed = [
+        item
+        for metadata in records
+        if isinstance(metadata, dict) and (item := _workspace_listing_record(metadata)) is not None
+    ]
+    listed.sort(key=lambda item: datetime.fromisoformat(item["created_at"]), reverse=True)
+    return listed[:MAX_WORKSPACE_LIST]
 
 
 def active_project_directory(workspace_id: str, metadata: dict[str, Any]) -> Path:
@@ -483,7 +573,7 @@ async def ensure_implementation_worktree(value: str) -> tuple[dict[str, Any], Pa
     metadata["file_count"] = len(files)
     metadata["files_preview"] = files[:100]
     metadata["project_overview"] = analyze_project(worktree_directory, files)
-    metadata["project_overview_version"] = 2
+    metadata["project_overview_version"] = PROJECT_OVERVIEW_VERSION
     await _persist_metadata(metadata, base_directory)
     return metadata, worktree_directory
 

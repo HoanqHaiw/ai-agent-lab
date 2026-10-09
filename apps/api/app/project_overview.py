@@ -9,6 +9,7 @@ from typing import Any
 from xml.etree import ElementTree
 
 MAX_PROJECT_FILES = 10_000
+PROJECT_OVERVIEW_VERSION = 3
 IGNORED_PARTS = {
     ".git", "node_modules", "dist", "build", ".next", ".venv", "venv",
     "coverage", "vendor", "__pycache__", ".cache", ".agent-lab-baseline",
@@ -366,6 +367,71 @@ def _source_api_frameworks(root: Path, file_names: set[str]) -> set[str]:
     return found
 
 
+def _project_health_signals(file_names: set[str]) -> list[dict[str, Any]]:
+    checks = (
+        (
+            "tests",
+            "Test-related files",
+            lambda path: (
+                any(part in {"test", "tests", "__tests__", "spec"} for part in Path(path).parts[:-1])
+                or Path(path).name.casefold().startswith(("test_", "tests_"))
+                or Path(path).name.casefold().endswith(("_test.py", ".test.ts", ".test.tsx", ".spec.ts", ".spec.tsx"))
+                or Path(path).name.casefold().endswith("_test.go")
+                or Path(path).name.casefold() in {"pytest.ini", "tox.ini", "jest.config.js", "jest.config.ts", "vitest.config.ts", "vitest.config.mts"}
+            ),
+        ),
+        (
+            "ci",
+            "CI configuration",
+            lambda path: (
+                path.startswith(".github/workflows/")
+                or Path(path).name.casefold() in {".gitlab-ci.yml", "azure-pipelines.yml", "jenkinsfile"}
+            ),
+        ),
+        (
+            "containers",
+            "Container or deployment configuration",
+            lambda path: (
+                Path(path).name.casefold() in {
+                    "dockerfile", "docker-compose.yml", "docker-compose.yaml",
+                    "compose.yml", "compose.yaml", "kustomization.yaml",
+                }
+                or path.startswith(("k8s/", "kubernetes/"))
+            ),
+        ),
+        (
+            "documentation",
+            "Project documentation",
+            lambda path: (
+                Path(path).name.casefold().startswith("readme.")
+                or path.startswith("docs/")
+            ),
+        ),
+        (
+            "dependency-locks",
+            "Dependency lockfiles",
+            lambda path: Path(path).name.casefold() in {
+                "package-lock.json", "npm-shrinkwrap.json", "pnpm-lock.yaml",
+                "yarn.lock", "bun.lock", "bun.lockb", "poetry.lock",
+                "uv.lock", "pdm.lock", "pipfile.lock", "cargo.lock",
+            },
+        ),
+    )
+    signals = []
+    for signal_id, label, matches in checks:
+        evidence = sorted(
+            (original for original in file_names if matches(original.replace("\\", "/").casefold())),
+            key=str.casefold,
+        )[:8]
+        signals.append({
+            "id": signal_id,
+            "label": label,
+            "status": "detected" if evidence else "not_detected",
+            "evidence_files": evidence,
+        })
+    return signals
+
+
 def analyze_project(root: Path, file_paths: list[str]) -> dict[str, Any]:
     languages: dict[str, int] = {}
     top_level: dict[str, str] = {}
@@ -447,4 +513,8 @@ def analyze_project(root: Path, file_paths: list[str]) -> dict[str, Any]:
         "database": {"systems": database_systems, "evidence_files": database_files},
         "api": {"frameworks": api_frameworks, "route_files": api_files},
         "authentication": {"signals": authentication_signals, "evidence_files": authentication_files},
+        "health": {
+            "signals": _project_health_signals(file_names),
+            "scope_note": "Static file-presence indicators only. Missing evidence does not establish that a capability is absent, and this is not a quality, security, or coverage score.",
+        },
     }

@@ -12,7 +12,7 @@ from typing import Any
 from uuid import UUID, uuid4
 
 from .task_analysis import MAX_CONTEXT_CHARS, MAX_CONTEXT_FILES, MAX_FILE_BYTES, MODEL, _context_files, _gemini_request
-from .project_overview import analyze_project, discover_project_files
+from .project_overview import PROJECT_OVERVIEW_VERSION, analyze_project, discover_project_files
 from .workspaces import WORKSPACE_ROOT, WorkspaceError, _persist_metadata, active_project_directory, ensure_implementation_worktree, get_workspace
 
 MAX_DRAFT_FILES = 5
@@ -319,22 +319,23 @@ async def apply_implementation_draft(workspace_id: str, draft_id: str) -> dict[s
     written: list[tuple[Path, str | None]] = []
     try:
         for target, before, content in prepared:
-            target.parent.mkdir(parents=True, exist_ok=True)
-            with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", newline="", dir=target.parent, delete=False) as temporary:
-                temporary.write(content)
-                temp_name = temporary.name
-            os.replace(temp_name, target)
+            _atomic_write(target, content)
             written.append((target, before))
     except OSError as exc:
+        rollback_failures = []
         for target, before in reversed(written):
             try:
                 if before is None:
                     target.unlink(missing_ok=True)
                 else:
-                    target.write_text(before, encoding="utf-8")
+                    _atomic_write(target, before)
             except OSError:
-                pass
-        raise WorkspaceError("Could not apply all file changes. The workspace was rolled back where possible.", 500) from exc
+                rollback_failures.append(target.relative_to(root).as_posix())
+        detail = (
+            f" Automatic rollback could not restore: {', '.join(rollback_failures)}. Inspect the workspace before retrying."
+            if rollback_failures else " The previously changed files were restored."
+        )
+        raise WorkspaceError(f"Could not apply all file changes.{detail}", 500) from exc
 
     draft["status"] = "applied"
     draft["applied_at"] = datetime.now(timezone.utc).isoformat()
@@ -347,7 +348,7 @@ async def apply_implementation_draft(workspace_id: str, draft_id: str) -> dict[s
     metadata["file_count"] = len(files)
     metadata["files_preview"] = files[:100]
     metadata["project_overview"] = analyze_project(root, files)
-    metadata["project_overview_version"] = 2
+    metadata["project_overview_version"] = PROJECT_OVERVIEW_VERSION
     await _persist_metadata(metadata, metadata_root)
     return {"id": draft["id"], "status": "applied", "paths": [item["path"] for item in draft["files"]]}
 
@@ -404,12 +405,17 @@ async def rollback_implementation_draft(workspace_id: str, draft_id: str) -> dic
                 _atomic_write(target, previous)
             reverted.append((target, previous, applied_content))
     except OSError as exc:
+        restoration_failures = []
         for target, previous, applied_content in reversed(reverted):
             try:
                 _atomic_write(target, applied_content)
             except OSError:
-                pass
-        raise WorkspaceError("Could not revert all file changes. The applied version was restored where possible.", 500) from exc
+                restoration_failures.append(target.relative_to(root).as_posix())
+        detail = (
+            f" Restoration of applied content failed for: {', '.join(restoration_failures)}. Inspect the workspace immediately."
+            if restoration_failures else " The applied versions were restored."
+        )
+        raise WorkspaceError(f"Could not revert all file changes.{detail}", 500) from exc
 
     draft["status"] = "reverted"
     draft["reverted_at"] = datetime.now(timezone.utc).isoformat()
@@ -419,6 +425,6 @@ async def rollback_implementation_draft(workspace_id: str, draft_id: str) -> dic
     metadata["file_count"] = len(files)
     metadata["files_preview"] = files[:100]
     metadata["project_overview"] = analyze_project(root, files)
-    metadata["project_overview_version"] = 2
+    metadata["project_overview_version"] = PROJECT_OVERVIEW_VERSION
     await _persist_metadata(metadata, metadata_root)
     return {"id": draft["id"], "status": "reverted", "paths": [item["path"] for item in draft["files"]]}
