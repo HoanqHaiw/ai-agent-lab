@@ -1,0 +1,37 @@
+services:
+  - type: web
+    name: ai-agent-lab-api
+    runtime: python
+    plan: free
+    region: singapore
+    rootDir: apps/api
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      - key: ENVIRONMENT
+        value: preview
+      - key: AUTH_REQUIRED
+        value: "true"
+      - key: WORKSPACE_ROOT
+        value: /tmp/agent-lab-workspaces
+      - key: WORKSPACE_STORAGE_DURABLE
+        value: "false"
+      - key: MONGODB_DATABASE
+        value: agent_lab
+      - key: GEMINI_MODEL
+        value: gemini-3.8-flash
+      - key: VERIFICATION_ALLOW_DEPENDENCY_NETWORK
+        value: "false"
+      - key: MONGODB_URI
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: CLERK_ISSUER
+        sync: false
+      - key: CLERK_JWKS_URL
+        sync: false
+      - key: WEB_ORIGIN
+        sync: false
+      - key: AUTHORIZED_PARTIES
+        sync: false

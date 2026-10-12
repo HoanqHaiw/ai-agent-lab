@@ -35,6 +35,12 @@ The API host needs Git for public repository import and a working Docker CLI/dae
 
 Restrict MongoDB Atlas network access to the API host's egress IP when stable, use TLS, and keep all secret values in the hosting providers' secret managers. Do not put backend credentials in Vercel's `NEXT_PUBLIC_*` variables.
 
+## Free preview with Render
+
+The root `render.yaml` defines a free Singapore web service for a temporary preview. In Render, create a Blueprint from this repository and provide the prompted secret values. After the service deploys, use its `https://<service>.onrender.com` URL for `NEXT_PUBLIC_API_BASE_URL` in Vercel. Set `WEB_ORIGIN` and `AUTHORIZED_PARTIES` to the exact Vercel site origin (for example, `https://ai-agent-lab.vercel.app`); add preview origins only when they are needed. Set `CLERK_ISSUER` and `CLERK_JWKS_URL` to the same Clerk instance used by the Vercel site. Keep `AUTH_REQUIRED=true`.
+
+This is a preview configuration, not durable hosting. Render Free sleeps after 15 minutes without inbound traffic, and its filesystem is ephemeral. MongoDB can retain workspace metadata, but imported repository files, drafts, and Git worktrees under `/tmp/agent-lab-workspaces` may disappear after a restart, sleep, or deploy. The API's `/ready` response marks this storage as `ephemeral`; Docker-based lint/build/test checks will be unavailable unless a separate sandbox service is configured. Do not use this preview for important or confidential repositories. For a durable release, move repository content to object storage and run verification in a dedicated sandbox before switching to a production API host.
+
 ## Before enabling public traffic
 
 The current product has no durable object-storage adapter, background job queue, request rate limiting, or multi-instance workspace coordination. Keep the API single-instance and access-controlled until those pieces are implemented. Review data retention and backups for the persistent workspace volume and MongoDB before inviting users to upload private repositories.

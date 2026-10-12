@@ -98,8 +98,11 @@ def _docker_daemon_available() -> bool:
 async def readiness() -> JSONResponse:
     """Report dependency readiness without returning secrets or connection strings."""
     mongo_uri = os.environ.get("MONGODB_URI", "").strip()
+    workspace_storage = "ready" if WORKSPACE_ROOT.is_dir() and os.access(WORKSPACE_ROOT, os.W_OK) else "unavailable"
+    if workspace_storage == "ready" and os.environ.get("WORKSPACE_STORAGE_DURABLE", "true").strip().casefold() in {"0", "false", "no", "off"}:
+        workspace_storage = "ephemeral"
     dependencies = {
-        "workspace_storage": "ready" if WORKSPACE_ROOT.is_dir() and os.access(WORKSPACE_ROOT, os.W_OK) else "unavailable",
+        "workspace_storage": workspace_storage,
         "mongodb": "not_configured",
         "gemini": "configured" if os.environ.get("GEMINI_API_KEY", "").strip() else "not_configured",
         "clerk": "configured" if os.environ.get("CLERK_ISSUER", "").strip() else "not_configured",
@@ -133,6 +136,10 @@ async def readiness() -> JSONResponse:
             "status": "ready" if required_ready else "degraded",
             "service": "ai-agent-lab-api",
             "dependencies": dependencies,
+            "capabilities": {
+                "durable_workspaces": dependencies["workspace_storage"] == "ready",
+                "repository_verification": dependencies["docker"] == "available",
+            },
         },
     )
 
