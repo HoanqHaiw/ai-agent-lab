@@ -16,10 +16,54 @@ from app.code_intelligence import _validate_review
 from app.implementation_engine import _safe_target
 from app.main import ConfirmationRequest, apply_workspace_implementation, rollback_workspace_implementation, workspace_list
 from app.task_analysis import _validate_citations
-from app.workspaces import WorkspaceError, _archive_path, _normalize_github_url, ensure_workspace_owner, list_workspaces
+from app.project_overview import PROJECT_OVERVIEW_VERSION
+from app.workspaces import WorkspaceError, _archive_path, _normalize_github_url, _workspace_listing_record, claim_workspace, ensure_workspace_owner, list_workspaces, remove_expired_workspaces, validate_persistence_configuration
 
 
 class WorkspaceSafetyTests(unittest.TestCase):
+    def test_signed_in_workspace_does_not_expire_with_guest_retention(self) -> None:
+        now = datetime.now(timezone.utc)
+        record = {
+            "id": "11111111-1111-4111-8111-111111111111",
+            "owner_id": "user_123",
+            "name": "account workspace",
+            "source": "ZIP upload",
+            "created_at": now.isoformat(),
+            "expires_at": (now - timedelta(days=1)).isoformat(),
+        }
+        listed = _workspace_listing_record(record)
+        self.assertIsNotNone(listed)
+        self.assertIsNone(listed["expires_at"])
+
+    def test_claiming_guest_workspace_links_owner_and_removes_guest_expiration(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            workspace_id = "11111111-1111-4111-8111-111111111111"
+            directory = root / workspace_id
+            directory.mkdir()
+            now = datetime.now(timezone.utc)
+            metadata = {
+                "id": workspace_id,
+                "owner_id": None,
+                "name": "guest workspace",
+                "source": "ZIP upload",
+                "status": "ready",
+                "file_count": 1,
+                "files_preview": ["README.md"],
+                "project_overview_version": PROJECT_OVERVIEW_VERSION,
+                "analyses": [],
+                "created_at": now.isoformat(),
+                "expires_at": (now + timedelta(days=7)).isoformat(),
+            }
+            (directory / "workspace.json").write_text(json.dumps(metadata), encoding="utf-8")
+            with patch("app.workspaces.WORKSPACE_ROOT", root), patch.dict(os.environ, {"MONGODB_URI": ""}):
+                result = asyncio.run(claim_workspace(workspace_id, "user_123"))
+                saved = json.loads((directory / "workspace.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(result["status"], "claimed")
+        self.assertEqual(saved["owner_id"], "user_123")
+        self.assertIsNone(saved["expires_at"])
+
     def test_workspace_owner_is_exact_and_guest_workspaces_are_not_user_owned(self) -> None:
         ensure_workspace_owner({"owner_id": "user_123"}, "user_123")
         ensure_workspace_owner({"owner_id": None}, None)
@@ -37,7 +81,7 @@ class WorkspaceSafetyTests(unittest.TestCase):
             records = (
                 ("11111111-1111-4111-8111-111111111111", "user_123", current),
                 ("22222222-2222-4222-8222-222222222222", "user_456", current),
-                ("33333333-3333-4333-8333-333333333333", "user_123", current - timedelta(days=8)),
+                ("33333333-3333-4333-8333-333333333333", None, current - timedelta(days=8)),
             )
             for workspace_id, owner_id, created_at in records:
                 directory = root / workspace_id
@@ -59,6 +103,39 @@ class WorkspaceSafetyTests(unittest.TestCase):
 
         self.assertEqual([item["id"] for item in listed], [records[0][0]])
         self.assertNotIn("owner_id", listed[0])
+
+    def test_expired_signed_in_workspace_is_not_removed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            directory = root / "11111111-1111-4111-8111-111111111111"
+            directory.mkdir()
+            created_at = datetime.now(timezone.utc) - timedelta(days=30)
+            (directory / "workspace.json").write_text(
+                json.dumps({
+                    "id": directory.name,
+                    "owner_id": "user_123",
+                    "name": "long-lived workspace",
+                    "source": "ZIP upload",
+                    "created_at": created_at.isoformat(),
+                    "expires_at": (created_at + timedelta(days=7)).isoformat(),
+                }),
+                encoding="utf-8",
+            )
+            with patch("app.workspaces.WORKSPACE_ROOT", root), patch.dict(os.environ, {"MONGODB_URI": ""}):
+                asyncio.run(remove_expired_workspaces())
+            self.assertTrue(directory.is_dir())
+
+    def test_production_requires_authentication_and_persistent_storage_settings(self) -> None:
+        settings = {
+            "ENVIRONMENT": "production",
+            "AUTH_REQUIRED": "false",
+            "CLERK_ISSUER": "",
+            "MONGODB_URI": "",
+            "WORKSPACE_ROOT": "",
+        }
+        with patch.dict(os.environ, settings, clear=True):
+            with self.assertRaisesRegex(RuntimeError, "AUTH_REQUIRED=true"):
+                asyncio.run(validate_persistence_configuration())
 
     def test_guest_workspace_listing_does_not_disclose_other_guest_workspaces(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

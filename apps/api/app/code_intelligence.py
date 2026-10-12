@@ -38,7 +38,10 @@ ALLOWED_SEVERITIES = {"critical", "high", "medium", "low", "info"}
 
 def _review_context(root: Path) -> tuple[list[dict[str, Any]], set[str]]:
     focus = "Review bugs security performance refactoring code quality dependencies tests services routes"
-    contexts, available = _context_files(str(root.name), focus)
+    # Keep the repository root itself: _context_files walks this path to build
+    # its inventory and read snippets. Passing root.name silently points the
+    # scan at a non-existent relative directory and makes every review fail.
+    contexts, available = _context_files(root, focus)
     selected = {item["path"] for item in contexts}
     total_chars = sum(len(item["content"]) for item in contexts)
     manifest_paths = [path for path in discover_project_files(root) if Path(path).name.casefold() in MANIFEST_NAMES]
@@ -122,7 +125,7 @@ async def review_workspace(workspace_id: str) -> dict[str, Any]:
     )
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL}:generateContent"
     body = {"contents": [{"parts": [{"text": prompt}]}], "generationConfig": {
-        "responseFormat": {"text": {"mimeType": "application/json", "schema": REVIEW_SCHEMA}}, "temperature": 0.1
+        "responseFormat": {"text": {"mimeType": "APPLICATION_JSON", "schema": REVIEW_SCHEMA}}, "temperature": 0.1
     }}
     try:
         status, envelope = await asyncio.wait_for(asyncio.to_thread(_gemini_request, url, api_key, body), timeout=65)
@@ -134,6 +137,8 @@ async def review_workspace(workspace_id: str) -> dict[str, Any]:
         raise WorkspaceError("Gemini free-tier quota is temporarily unavailable. Please try again later.", 429)
     if status in {401, 403}:
         raise WorkspaceError("Gemini rejected the configured API key. Check GEMINI_API_KEY.", 503)
+    if status == 503:
+        raise WorkspaceError("Gemini is temporarily busy. Wait a minute, then run the review again.", 503)
     if status >= 400:
         raise WorkspaceError("Gemini could not complete this review. Please try again.", 502)
     try:

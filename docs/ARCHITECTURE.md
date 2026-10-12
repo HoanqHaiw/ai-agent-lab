@@ -10,7 +10,7 @@ Browser
             ├─ Workspace/import and temporary filesystem storage
             ├─ Static project overview and bounded file retrieval
             ├─ Gemini task analysis, chat, review, and draft generation
-            ├─ App-managed Git checkpoint/worktree for reviewed changes
+            ├─ App-managed Git checkpoint/worktree and read-only status
             ├─ Docker-based verification runner
             └─ Optional MongoDB metadata persistence
 ```
@@ -20,10 +20,10 @@ The browser never receives `GEMINI_API_KEY` or `MONGODB_URI`. FastAPI verifies C
 ## Data lifecycle
 
 1. GitHub public repositories are shallow-cloned, or ZIP files are extracted, into a workspace under `WORKSPACE_ROOT`.
-2. A bounded file inventory and deterministic project overview are created, including evidence-backed file-presence signals for tests, CI, deployment/container configuration, docs, and dependency lockfiles. These signals do not produce a quality/security score. MongoDB, when configured, stores workspace metadata and history, not source files. Authenticated workspaces are listed through an owner-filtered API; guest browsers store only their own workspace IDs locally, and the API does not enumerate anonymous workspaces.
+2. A bounded file inventory and deterministic project overview are created, including evidence-backed file-presence signals for tests, CI, deployment/container configuration, docs, and dependency lockfiles. These signals do not produce a quality/security score. MongoDB, when configured, stores workspace metadata and history, not source files. Authenticated workspaces are listed through an owner-filtered API; guest browsers store only their own workspace IDs locally, and the API does not enumerate anonymous workspaces. After sign-in, saved guest IDs can claim unowned workspaces for that account.
 3. Task/chat/review/draft requests send selected, line-numbered text snippets to Gemini. Common secret/config files are excluded; this is a demo filter, not a guarantee that every secret format is recognized.
 4. Approved implementation changes are written only to an app-managed branch/worktree. Apply and rollback require explicit confirmations; both check file hashes to avoid overwriting changed files.
-5. Workspace data expires after seven days. The default filesystem location is local to the API process, so a hosted or multi-instance deployment needs durable shared storage that is not provided here.
+5. Guest workspace data expires after seven days; signed-in workspace data does not expire automatically. In production, MongoDB stores metadata while repository files and drafts remain on a persistent `WORKSPACE_ROOT` volume attached to one API instance. Startup checks require auth, MongoDB, and an explicit writable workspace root. This is not multi-instance storage.
 
 ## Verification boundary
 
@@ -35,4 +35,4 @@ The container uses the host Docker daemon; Docker isolation is not a substitute 
 
 ## Current non-goals / missing components
 
-There is no generic terminal/tool API, user-facing Git commit/push/PR workflow, CI result integration in the app, private GitHub access, multi-agent orchestrator, curated project memory, document-generation workflow, project health dashboard, production deployment manifest, object storage, or multi-instance workspace service. GitHub Actions currently runs the API and web checks on pushes to `main`/`codex/**` and pull requests targeting `main`. The current Gemini review is static and bounded; it is not an independent verifier, CVE scanner, test-coverage report, or performance measurement.
+Git status is available as a read-only workspace view; no user-facing Git commit/push/PR workflow, generic terminal/tool API, CI result integration in the app, private GitHub access, multi-agent orchestrator, curated project memory, document-generation workflow, project health dashboard, production deployment manifest, object storage, or multi-instance workspace service is available yet. GitHub Actions currently runs the API and web checks on pushes to `main`/`codex/**` and pull requests targeting `main`. The current Gemini review is static and bounded; it is not an independent verifier, CVE scanner, test-coverage report, or performance measurement.

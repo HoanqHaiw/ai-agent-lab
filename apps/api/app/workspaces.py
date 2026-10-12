@@ -31,7 +31,9 @@ IGNORED_PARTS = {
 }
 
 WORKSPACE_ROOT = Path(os.environ.get("WORKSPACE_ROOT") or Path(__file__).resolve().parents[1] / ".workspaces").resolve()
-WORKSPACE_ROOT.mkdir(parents=True, exist_ok=True)
+IS_PRODUCTION = os.environ.get("ENVIRONMENT", "development").strip().casefold() in {"production", "prod"}
+if not IS_PRODUCTION:
+    WORKSPACE_ROOT.mkdir(parents=True, exist_ok=True)
 logger = logging.getLogger(__name__)
 
 
@@ -39,6 +41,42 @@ class WorkspaceError(Exception):
     def __init__(self, message: str, status_code: int = 400):
         super().__init__(message)
         self.status_code = status_code
+
+
+async def validate_persistence_configuration() -> None:
+    """Fail startup when production is not configured with durable metadata and workspace storage."""
+    production = os.environ.get("ENVIRONMENT", "development").strip().casefold() in {"production", "prod"}
+    mongo_uri = os.environ.get("MONGODB_URI", "").strip()
+    workspace_root_configured = bool(os.environ.get("WORKSPACE_ROOT", "").strip())
+
+    if production and os.environ.get("AUTH_REQUIRED", "").strip().casefold() not in {"1", "true", "yes", "on"}:
+        raise RuntimeError("AUTH_REQUIRED=true is required in production.")
+    if production and not os.environ.get("CLERK_ISSUER", "").strip():
+        raise RuntimeError("CLERK_ISSUER is required in production to validate signed-in users.")
+    if production and not mongo_uri:
+        raise RuntimeError("MONGODB_URI is required in production so workspace ownership and history are durable.")
+    if production and not workspace_root_configured:
+        raise RuntimeError("WORKSPACE_ROOT must point to a persistent mounted volume in production.")
+    if not WORKSPACE_ROOT.is_dir() or not os.access(WORKSPACE_ROOT, os.W_OK):
+        raise RuntimeError("WORKSPACE_ROOT must exist and be writable by the API process.")
+    if not mongo_uri:
+        return
+
+    try:
+        from pymongo import AsyncMongoClient
+
+        client = AsyncMongoClient(mongo_uri, serverSelectionTimeoutMS=5000)
+        try:
+            await client.admin.command("ping")
+            database_name = os.environ.get("MONGODB_DATABASE") or "agent_lab"
+            await client[database_name].workspaces.create_index(
+                [("owner_id", 1), ("created_at", -1)],
+                name="workspace_owner_created",
+            )
+        finally:
+            await client.close()
+    except Exception as exc:
+        raise RuntimeError("MongoDB persistence is configured but unavailable; check MONGODB_URI and Atlas network access.") from exc
 
 
 def _safe_workspace_id(value: str) -> str:
@@ -77,6 +115,7 @@ async def _persist_metadata(metadata: dict[str, Any], directory: Path) -> None:
     mongo_uri = os.environ.get("MONGODB_URI")
     if not mongo_uri:
         return
+    client = None
     try:
         from pymongo import AsyncMongoClient
 
@@ -86,9 +125,11 @@ async def _persist_metadata(metadata: dict[str, Any], directory: Path) -> None:
         await client[database_name].workspaces.replace_one(
             {"_id": metadata["id"]}, metadata, upsert=True
         )
-        await client.close()
     except Exception as exc:
         raise WorkspaceError("Could not save workspace metadata to MongoDB. Check MONGODB_URI and Atlas network access.", 503) from exc
+    finally:
+        if client is not None:
+            await client.close()
 
 
 async def _read_metadata(workspace_id: str, directory: Path) -> dict[str, Any] | None:
@@ -98,9 +139,11 @@ async def _read_metadata(workspace_id: str, directory: Path) -> dict[str, Any] |
             from pymongo import AsyncMongoClient
 
             client = AsyncMongoClient(mongo_uri, serverSelectionTimeoutMS=4000)
-            database_name = os.environ.get("MONGODB_DATABASE") or "agent_lab"
-            doc = await client[database_name].workspaces.find_one({"_id": workspace_id})
-            await client.close()
+            try:
+                database_name = os.environ.get("MONGODB_DATABASE") or "agent_lab"
+                doc = await client[database_name].workspaces.find_one({"_id": workspace_id})
+            finally:
+                await client.close()
             if doc:
                 doc.pop("_id", None)
                 return doc
@@ -122,9 +165,11 @@ async def _delete_metadata(workspace_id: str) -> None:
     from pymongo import AsyncMongoClient
 
     client = AsyncMongoClient(mongo_uri, serverSelectionTimeoutMS=4000)
-    database_name = os.environ.get("MONGODB_DATABASE") or "agent_lab"
-    await client[database_name].workspaces.delete_one({"_id": workspace_id})
-    await client.close()
+    try:
+        database_name = os.environ.get("MONGODB_DATABASE") or "agent_lab"
+        await client[database_name].workspaces.delete_one({"_id": workspace_id})
+    finally:
+        await client.close()
 
 
 async def create_workspace_from_zip(upload: UploadFile, owner_id: str | None = None) -> dict[str, Any]:
@@ -200,7 +245,7 @@ async def create_workspace_from_zip(upload: UploadFile, owner_id: str | None = N
 
         extracted_files.sort(key=str.casefold)
         created_at = datetime.now(timezone.utc)
-        expires_at = created_at + timedelta(days=RETENTION_DAYS)
+        expires_at = created_at + timedelta(days=RETENTION_DAYS) if owner_id is None else None
         result = {
             "id": workspace_id,
             "owner_id": owner_id,
@@ -213,7 +258,7 @@ async def create_workspace_from_zip(upload: UploadFile, owner_id: str | None = N
             "project_overview_version": PROJECT_OVERVIEW_VERSION,
             "analyses": [],
             "created_at": created_at.isoformat(),
-            "expires_at": expires_at.isoformat(),
+            "expires_at": expires_at.isoformat() if expires_at else None,
         }
         await _persist_metadata(result, directory)
         return result
@@ -344,7 +389,7 @@ async def create_workspace_from_github(repo_url: str, owner_id: str | None = Non
             "project_overview_version": PROJECT_OVERVIEW_VERSION,
             "analyses": [],
             "created_at": created_at.isoformat(),
-            "expires_at": (created_at + timedelta(days=RETENTION_DAYS)).isoformat(),
+            "expires_at": (created_at + timedelta(days=RETENTION_DAYS)).isoformat() if owner_id is None else None,
         }
         await _persist_metadata(result, directory)
         return result
@@ -365,14 +410,20 @@ async def get_workspace(value: str) -> dict[str, Any]:
     metadata = await _read_metadata(workspace_id, directory)
     if not metadata:
         raise WorkspaceError("Workspace not found.", 404)
-    expires_at = datetime.fromisoformat(metadata["expires_at"])
-    if expires_at <= datetime.now(timezone.utc):
+    expires_value = metadata.get("expires_at")
+    if metadata.get("owner_id") is None and expires_value:
+        expires_at = datetime.fromisoformat(expires_value)
+    else:
+        expires_at = None
+    if expires_at is not None and expires_at <= datetime.now(timezone.utc):
         shutil.rmtree(directory, ignore_errors=True)
         await _delete_metadata(workspace_id)
         shutil.rmtree(WORKSPACE_ROOT / ".agent-lab-drafts" / workspace_id, ignore_errors=True)
         shutil.rmtree(WORKSPACE_ROOT / ".agent-lab-worktrees" / workspace_id, ignore_errors=True)
         raise WorkspaceError("This workspace has expired. Import the project again to continue.", 410)
     project_directory = active_project_directory(workspace_id, metadata)
+    if not project_directory.is_dir():
+        raise WorkspaceError("Workspace source files are missing from WORKSPACE_ROOT. Restore the persistent workspace volume before continuing.", 410)
     if metadata.get("project_overview_version") != PROJECT_OVERVIEW_VERSION:
         files = discover_project_files(project_directory)
         metadata["file_count"] = len(files)
@@ -384,6 +435,63 @@ async def get_workspace(value: str) -> dict[str, Any]:
         metadata["analyses"] = []
         await _persist_metadata(metadata, directory)
     return metadata
+
+
+async def claim_workspace(value: str, owner_id: str) -> dict[str, str]:
+    """Attach an unowned guest workspace to the authenticated user that presents its ID."""
+    workspace_id = _safe_workspace_id(value)
+    if not owner_id:
+        raise WorkspaceError("Sign in before saving this workspace to your account.", 401)
+
+    metadata = await get_workspace(workspace_id)
+    current_owner = metadata.get("owner_id")
+    if current_owner == owner_id:
+        return {"id": workspace_id, "status": "already_owned"}
+    if current_owner is not None:
+        raise WorkspaceError("This workspace is already linked to another account.", 409)
+
+    metadata["owner_id"] = owner_id
+    metadata["expires_at"] = None
+    mongo_uri = os.environ.get("MONGODB_URI")
+    if mongo_uri:
+        try:
+            from pymongo import AsyncMongoClient
+            from pymongo.errors import DuplicateKeyError
+
+            client = AsyncMongoClient(mongo_uri, serverSelectionTimeoutMS=4000)
+            try:
+                database_name = os.environ.get("MONGODB_DATABASE") or "agent_lab"
+                collection = client[database_name].workspaces
+                result = await collection.update_one(
+                    {"_id": workspace_id, "owner_id": None},
+                    {"$set": {"owner_id": owner_id, "expires_at": None}},
+                )
+                if result.matched_count == 0:
+                    current = await collection.find_one({"_id": workspace_id}, {"owner_id": 1})
+                    if current and current.get("owner_id") == owner_id:
+                        pass
+                    elif current:
+                        raise WorkspaceError("This workspace could not be safely linked to your account.", 409)
+                    else:
+                        try:
+                            await collection.insert_one({"_id": workspace_id, **metadata})
+                        except DuplicateKeyError:
+                            current = await collection.find_one({"_id": workspace_id}, {"owner_id": 1})
+                            if not current or current.get("owner_id") != owner_id:
+                                raise WorkspaceError("This workspace could not be safely linked to your account.", 409)
+            finally:
+                await client.close()
+        except WorkspaceError:
+            raise
+        except Exception as exc:
+            raise WorkspaceError("Could not save this workspace to your account in MongoDB.", 503) from exc
+
+    metadata_path = WORKSPACE_ROOT / workspace_id / "workspace.json"
+    try:
+        metadata_path.write_text(json.dumps(metadata, ensure_ascii=False), encoding="utf-8")
+    except OSError as exc:
+        raise WorkspaceError("The workspace was linked, but its local metadata could not be updated.", 500) from exc
+    return {"id": workspace_id, "status": "claimed"}
 
 
 def _workspace_listing_record(metadata: dict[str, Any]) -> dict[str, Any] | None:
@@ -399,16 +507,21 @@ def _workspace_listing_record(metadata: dict[str, Any]) -> dict[str, Any] | None
     except ValueError:
         return None
     try:
-        expires_at = datetime.fromisoformat(metadata["expires_at"])
         created_at = datetime.fromisoformat(metadata["created_at"])
     except (KeyError, TypeError, ValueError):
         return None
-    if expires_at.tzinfo is None:
-        expires_at = expires_at.replace(tzinfo=timezone.utc)
     if created_at.tzinfo is None:
         created_at = created_at.replace(tzinfo=timezone.utc)
-    if expires_at <= datetime.now(timezone.utc):
-        return None
+    expires_at = None
+    if metadata.get("owner_id") is None:
+        try:
+            expires_at = datetime.fromisoformat(metadata["expires_at"])
+        except (KeyError, TypeError, ValueError):
+            return None
+        if expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=timezone.utc)
+        if expires_at <= datetime.now(timezone.utc):
+            return None
     fields = (
         "id", "name", "source", "status", "file_count", "files_preview",
         "project_overview", "analyses", "chat_messages", "code_reviews",
@@ -416,7 +529,7 @@ def _workspace_listing_record(metadata: dict[str, Any]) -> dict[str, Any] | None
     )
     record = {field: metadata[field] for field in fields if field in metadata}
     record["created_at"] = created_at.astimezone(timezone.utc).isoformat()
-    record["expires_at"] = expires_at.astimezone(timezone.utc).isoformat()
+    record["expires_at"] = expires_at.astimezone(timezone.utc).isoformat() if expires_at else None
     return record
 
 
@@ -435,7 +548,6 @@ async def list_workspaces(owner_id: str | None) -> list[dict[str, Any]]:
                 cursor = (
                     collection.find({
                         "owner_id": owner_id,
-                        "expires_at": {"$gt": datetime.now(timezone.utc).isoformat()},
                     })
                     .sort("created_at", -1)
                     .limit(MAX_WORKSPACE_LIST)
@@ -475,6 +587,71 @@ async def list_workspaces(owner_id: str | None) -> list[dict[str, Any]]:
     return listed[:MAX_WORKSPACE_LIST]
 
 
+async def list_analysis_history(owner_id: str, page: int, page_size: int, query: str) -> dict[str, Any]:
+    """Return a bounded history page, using MongoDB aggregation when persistence is enabled."""
+    needle = query.strip()
+    mongo_uri = os.environ.get("MONGODB_URI")
+    if mongo_uri:
+        try:
+            from pymongo import AsyncMongoClient
+
+            client = AsyncMongoClient(mongo_uri, serverSelectionTimeoutMS=4000)
+            try:
+                database_name = os.environ.get("MONGODB_DATABASE") or "agent_lab"
+                collection = client[database_name].workspaces
+                match: dict[str, Any] = {"owner_id": owner_id}
+                pipeline: list[dict[str, Any]] = [{"$match": match}, {"$unwind": "$analyses"}]
+                if needle:
+                    safe_query = re.escape(needle)
+                    pipeline.append({"$match": {"$or": [
+                        {"name": {"$regex": safe_query, "$options": "i"}},
+                        {"analyses.task": {"$regex": safe_query, "$options": "i"}},
+                    ]}})
+                pipeline.append({"$facet": {
+                    "items": [
+                        {"$sort": {"analyses.created_at": -1, "_id": 1}},
+                        {"$skip": (page - 1) * page_size},
+                        {"$limit": page_size},
+                        {"$project": {
+                            "_id": 0,
+                            "workspace": {"id": {"$toString": "$_id"}, "name": "$name", "source": "$source"},
+                            "analysis": "$analyses",
+                        }},
+                    ],
+                    "total": [{"$count": "value"}],
+                }})
+                aggregate = await collection.aggregate(pipeline)
+                result = await aggregate.to_list(length=1)
+                facet = result[0] if result else {"items": [], "total": []}
+                total = facet["total"][0]["value"] if facet["total"] else 0
+                return {"items": facet["items"], "page": page, "page_size": page_size, "total": total, "total_pages": (total + page_size - 1) // page_size}
+            finally:
+                await client.close()
+        except Exception as exc:
+            raise WorkspaceError("Could not load analysis history from MongoDB. Check MONGODB_URI and Atlas network access.", 503) from exc
+
+    workspaces = await list_workspaces(owner_id)
+    normalized_query = needle.casefold()
+    entries = []
+    for workspace in workspaces:
+        analyses = workspace.get("analyses")
+        if not isinstance(analyses, list):
+            continue
+        for record in analyses:
+            if not isinstance(record, dict) or not isinstance(record.get("id"), str):
+                continue
+            if normalized_query and normalized_query not in f"{workspace.get('name', '')} {record.get('task', '')}".casefold():
+                continue
+            entries.append({
+                "workspace": {"id": workspace["id"], "name": workspace["name"], "source": workspace["source"]},
+                "analysis": record,
+            })
+    entries.sort(key=lambda item: item["analysis"].get("created_at", ""), reverse=True)
+    total = len(entries)
+    start = (page - 1) * page_size
+    return {"items": entries[start:start + page_size], "page": page, "page_size": page_size, "total": total, "total_pages": (total + page_size - 1) // page_size}
+
+
 def active_project_directory(workspace_id: str, metadata: dict[str, Any]) -> Path:
     safe_id = _safe_workspace_id(workspace_id)
     if metadata.get("implementation_worktree"):
@@ -499,7 +676,7 @@ async def _run_workspace_git(workspace_id: str, cwd: Path, arguments: list[str],
     template_directory.mkdir(exist_ok=True)
     global_config.touch(exist_ok=True)
     environment = {key: value for key, value in os.environ.items() if not key.upper().startswith("GIT_")}
-    environment.update({"GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": str(global_config), "GIT_TERMINAL_PROMPT": "0", "GIT_LFS_SKIP_SMUDGE": "1"})
+    environment.update({"GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": str(global_config), "GIT_TERMINAL_PROMPT": "0", "GIT_LFS_SKIP_SMUDGE": "1", "GIT_OPTIONAL_LOCKS": "0"})
     process = await asyncio.create_subprocess_exec(
         git_executable, "-c", f"core.hooksPath={hooks_directory}", "-c", f"init.templateDir={template_directory}",
         *arguments, cwd=cwd, stdin=asyncio.subprocess.PIPE if input_data is not None else asyncio.subprocess.DEVNULL,
@@ -582,6 +759,82 @@ def ensure_workspace_owner(metadata: dict[str, Any], user_id: str | None) -> Non
     owner_id = metadata.get("owner_id")
     if owner_id != user_id:
         raise WorkspaceError("Workspace not found.", 404)
+
+
+async def delete_workspace(value: str, user_id: str | None) -> None:
+    """Permanently remove a workspace and its private implementation artifacts."""
+    workspace_id = _safe_workspace_id(value)
+    directory = WORKSPACE_ROOT / workspace_id
+    metadata = await _read_metadata(workspace_id, directory)
+    if metadata is None:
+        raise WorkspaceError("Workspace not found.", 404)
+    ensure_workspace_owner(metadata, user_id)
+
+    draft_directory = WORKSPACE_ROOT / ".agent-lab-drafts" / workspace_id
+    worktree_directory = WORKSPACE_ROOT / ".agent-lab-worktrees" / workspace_id
+    metadata_path = directory / "workspace.json"
+    mongo_configured = bool(os.environ.get("MONGODB_URI", "").strip())
+
+    # Remove the Mongo record first so a database outage cannot leave an inaccessible,
+    # half-deleted workspace. If filesystem cleanup then fails, restore the record.
+    try:
+        await _delete_metadata(workspace_id)
+    except Exception as exc:
+        logger.exception("Could not remove workspace metadata for %s", workspace_id)
+        raise WorkspaceError("Could not remove workspace metadata from the database. No workspace files were deleted.", 503) from exc
+
+    try:
+        for path in (worktree_directory, draft_directory):
+            _remove_workspace_path(path)
+
+        # Keep the local owner record until every project file and artifact is gone.
+        if directory.is_symlink():
+            directory.unlink()
+        elif directory.is_dir():
+            for child in directory.iterdir():
+                if child.name != "workspace.json":
+                    _remove_workspace_path(child)
+            if metadata_path.exists():
+                metadata_path.unlink()
+            directory.rmdir()
+    except Exception as exc:
+        # Compensate for the earlier metadata delete so the owner can retry safely.
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+            metadata_path.write_text(json.dumps(metadata, ensure_ascii=False), encoding="utf-8")
+            if mongo_configured:
+                await _persist_metadata(metadata, directory)
+        except Exception:
+            logger.exception("Could not restore workspace metadata after deletion failed for %s", workspace_id)
+        logger.exception("Could not remove workspace files for %s", workspace_id)
+        if isinstance(exc, OSError):
+            reason = "Windows denied access to one or more workspace files. Close programs using the workspace and retry."
+        else:
+            reason = "The workspace files could not be removed. Close programs using the workspace and retry."
+        raise WorkspaceError(reason, 503) from exc
+
+
+def _remove_workspace_path(path: Path) -> None:
+    """Remove one workspace-owned path, retrying read-only files on Windows."""
+    if path.is_symlink():
+        path.unlink()
+    elif path.is_dir():
+        shutil.rmtree(path, onerror=_retry_readonly_remove)
+    elif path.exists():
+        try:
+            path.unlink()
+        except PermissionError:
+            os.chmod(path, stat.S_IWRITE | stat.S_IREAD)
+            path.unlink()
+
+
+def _retry_readonly_remove(function: Any, path: str, exc_info: Any) -> None:
+    error = exc_info[1]
+    try:
+        os.chmod(path, stat.S_IWRITE | stat.S_IREAD)
+        function(path)
+    except OSError:
+        raise error
 
 
 async def read_workspace_file(value: str, file_path: str) -> dict[str, Any]:
@@ -694,7 +947,9 @@ async def remove_expired_workspaces() -> None:
             continue
         metadata = await _read_metadata(directory.name, directory)
         expired = False
-        if metadata:
+        if metadata and metadata.get("owner_id") is not None:
+            expired = False
+        elif metadata:
             try:
                 expired = datetime.fromisoformat(metadata["expires_at"]) <= datetime.now(timezone.utc)
             except (KeyError, ValueError, TypeError):

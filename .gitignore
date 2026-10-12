@@ -11,6 +11,8 @@ __pycache__/
 .DS_Store
 .vercel/
 .turbo/
+.pnpm-store/
+.tsupgrader/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/

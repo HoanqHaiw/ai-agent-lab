@@ -70,13 +70,13 @@ A developer who has received a task in an unfamiliar or partially familiar codeb
 2. **Import and analysis status** — progress, current stage, and actionable errors.
 3. **Project overview** — repository summary and structure.
 4. **Task analysis** — task input, agent response, evidence references, clarification questions, and plan.
-5. **Settings** — planned; provider status and demo configuration state should never display secret values.
+5. **System status** — reads the API `/ready` report and shows workspace storage, MongoDB, Gemini, Clerk, Git, and Docker readiness without displaying secret values.
 
 ## Technical boundaries for the first release
 
 - Next.js UI; FastAPI API and orchestration service.
 - MongoDB Atlas stores application records only: workspace metadata, analysis records, plans, and conversation state.
-- Repository files live in temporary isolated workspace storage and are removed by a documented cleanup policy.
+- Repository files live in isolated workspace directories. Guest workspaces expire after seven days; signed-in workspaces are retained until an operator removes them. Production uses MongoDB for metadata and requires a durable filesystem volume at `WORKSPACE_ROOT`; multiple API instances are not supported by this storage model.
 - Start with public GitHub repositories and ZIP upload; do not build GitHub OAuth until private-repository access is required.
 - Use a provider interface so Gemini can be swapped without coupling product logic to one SDK.
 - Use deterministic file discovery and retrieval before considering embeddings/vector databases.
@@ -90,7 +90,7 @@ Repository import, lightweight indexing, project overview, task analysis, eviden
 
 ### Phase 2 — Controlled implementation
 
-The demo supports approved plans, bounded drafts, diff review, separate apply confirmation, and stale-file-safe apply/rollback in an app-managed Git branch and worktree. GitHub imports checkpoint their temporary clone; ZIP imports initialize a temporary Git baseline from the safe file inventory. Verification requires an explicit click. npm workspace scripts are associated with the nearest declared workspace root, and each command runs in its package directory. Python source can receive a syntax check; Python test suites are shown as blocked until a safe dependency-preparation workflow is implemented. npm lockfile versions 1–3 are checked for registry-only dependency URLs; dependency installation is blocked unless the API operator explicitly sets `VERIFICATION_ALLOW_DEPENDENCY_NETWORK=true`. That setting permits Docker bridge egress without hostname enforcement, so leave it off for untrusted repositories. npm lifecycle scripts are disabled; selected checks run in a separate network-disabled container. The temporary copy has CPU/RAM/process limits, a timeout, and capped output, and is discarded afterward. pnpm, Yarn, and Bun are identified but blocked because safe locked installation is not yet implemented. Docker must be installed and its daemon reachable by the API host. The check engine has profile unit tests; live container execution remains unverified against a Docker daemon. It does not write to the user's original local repository or remote GitHub.
+The demo supports approved plans, bounded drafts, diff review, separate apply confirmation, and stale-file-safe apply/rollback in an app-managed Git branch and worktree. A read-only Git status view shows the active branch and changed paths while omitting sensitive paths. GitHub imports checkpoint their temporary clone; ZIP imports initialize a temporary Git baseline from the safe file inventory. Verification requires an explicit click. npm workspace scripts are associated with the nearest declared workspace root, and each command runs in its package directory. Python source can receive a syntax check; Python test suites are shown as blocked until a safe dependency-preparation workflow is implemented. npm lockfile versions 1–3 are checked for registry-only dependency URLs; dependency installation is blocked unless the API operator explicitly sets `VERIFICATION_ALLOW_DEPENDENCY_NETWORK=true`. That setting permits Docker bridge egress without hostname enforcement, so leave it off for untrusted repositories. npm lifecycle scripts are disabled; selected checks run in a separate network-disabled container. The temporary copy has CPU/RAM/process limits, a timeout, and capped output, and is discarded afterward. pnpm, Yarn, and Bun are identified but blocked because safe locked installation is not yet implemented. Docker must be installed and its daemon reachable by the API host. The user-triggered container flow has been exercised with lint and production build against a public sample repository. It does not write to the user's original local repository or remote GitHub.
 
 ### Phase 3 — Git workflow
 
@@ -102,7 +102,7 @@ Project conventions and decision memory, security/performance/test specialists, 
 
 ### Phase 5 — User accounts and workspace ownership
 
-Clerk sign-in/register and API token/owner checks are scaffolded. Enable Google in the Clerk dashboard and configure both web/API secrets before account flows are active. Existing guest workspaces are not transferred to user accounts. Phone-number OTP is not implemented; defer it until an SMS provider and cost/abuse controls are chosen. Keep sign-in separate from GitHub repository authorization, which grants access to private source repositories.
+Clerk sign-in/register and API token/owner checks are implemented. Enable Google in the Clerk dashboard and configure both web/API secrets before account flows are active. Guest workspace IDs saved by the same browser are claimed for the signed-in account at the next workspace load; already-owned workspaces remain available through the owner-filtered list. Guest workspaces are not transferable from another browser or after its local storage is cleared. Phone-number OTP is not implemented; defer it until an SMS provider and cost/abuse controls are chosen. Keep sign-in separate from GitHub repository authorization, which grants access to private source repositories.
 
 ## Decisions to revisit after the MVP demo
 

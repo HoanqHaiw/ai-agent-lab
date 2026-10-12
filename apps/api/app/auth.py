@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import os
+import logging
 from typing import Annotated
 
 import jwt
@@ -8,6 +10,7 @@ from fastapi import Header, HTTPException
 from jwt import PyJWKClient
 
 _jwk_client: PyJWKClient | None = None
+logger = logging.getLogger(__name__)
 
 
 def _auth_required() -> bool:
@@ -34,9 +37,36 @@ async def get_current_user_id(authorization: Annotated[str | None, Header()] = N
     if _jwk_client is None:
         _jwk_client = PyJWKClient(jwks_url, cache_keys=True)
     try:
-        signing_key = _jwk_client.get_signing_key_from_jwt(token).key
-        claims = jwt.decode(token, signing_key, algorithms=["RS256"], issuer=issuer, options={"require": ["exp", "iss", "sub"]})
-    except (jwt.PyJWTError, jwt.PyJWKClientError, OSError) as exc:
+        # PyJWKClient may fetch/refresh Clerk's JWKS over HTTP. Keep that
+        # blocking network call off FastAPI's event loop.
+        signing_key = (await asyncio.to_thread(_jwk_client.get_signing_key_from_jwt, token)).key
+        # Clerk and the API host can differ slightly in clock time; accept a
+        # small skew while still rejecting materially premature/expired tokens.
+        claims = jwt.decode(
+            token,
+            signing_key,
+            algorithms=["RS256"],
+            issuer=issuer,
+            leeway=60,
+            options={"require": ["exp", "iss", "sub"]},
+        )
+    except jwt.ExpiredSignatureError as exc:
+        logger.info("Clerk session token rejected: expired")
+        raise HTTPException(status_code=401, detail="Your sign-in session expired. Sign in again.") from exc
+    except jwt.ImmatureSignatureError as exc:
+        logger.warning("Clerk session token rejected: not yet valid (API clock may be behind Clerk)")
+        raise HTTPException(status_code=401, detail="The API server clock is behind the sign-in token. Synchronize the API host clock and retry.") from exc
+    except jwt.InvalidIssuerError as exc:
+        logger.warning("Clerk session token rejected: issuer mismatch")
+        raise HTTPException(status_code=401, detail="The sign-in token is from a different Clerk instance. Check CLERK_ISSUER.") from exc
+    except jwt.InvalidSignatureError as exc:
+        logger.warning("Clerk session token rejected: signature mismatch")
+        raise HTTPException(status_code=401, detail="The sign-in token signature does not match the configured Clerk JWKS.") from exc
+    except jwt.PyJWKClientError as exc:
+        logger.error("Clerk JWKS verification failed (%s)", type(exc).__name__)
+        raise HTTPException(status_code=503, detail="The API could not verify the session using the configured Clerk JWKS.") from exc
+    except (jwt.PyJWTError, OSError) as exc:
+        logger.warning("Clerk session token rejected (%s)", type(exc).__name__)
         raise HTTPException(status_code=401, detail="The session token is invalid or expired.") from exc
 
     authorized_party = claims.get("azp")

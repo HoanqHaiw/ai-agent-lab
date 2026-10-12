@@ -57,7 +57,7 @@ async def answer_project_question(workspace_id: str, question: str, history: lis
     )
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL}:generateContent"
     body = {"contents": [{"parts": [{"text": prompt}]}], "generationConfig": {
-        "responseFormat": {"text": {"mimeType": "application/json", "schema": CHAT_SCHEMA}}, "temperature": 0.2
+        "responseFormat": {"text": {"mimeType": "APPLICATION_JSON", "schema": CHAT_SCHEMA}}, "temperature": 0.2
     }}
     try:
         status, envelope = await asyncio.wait_for(asyncio.to_thread(_gemini_request, url, api_key, body), timeout=65)
@@ -69,6 +69,8 @@ async def answer_project_question(workspace_id: str, question: str, history: lis
         raise WorkspaceError("Gemini free-tier quota is temporarily unavailable. Please try again later.", 429)
     if status in {401, 403}:
         raise WorkspaceError("Gemini rejected the configured API key. Check GEMINI_API_KEY.", 503)
+    if status == 503:
+        raise WorkspaceError("Gemini is temporarily busy. Wait a minute, then try your question again.", 503)
     if status >= 400:
         raise WorkspaceError("Gemini could not answer this question. Please try again.", 502)
     try:

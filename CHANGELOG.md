@@ -4,6 +4,17 @@ Notable changes to AI Agent Lab are recorded here.
 
 ## Unreleased
 
+- Added a dependency readiness API and System health screen for storage, MongoDB, Gemini, Clerk, Git, and the Docker daemon without exposing secret values.
+- Improved verification failures with a compact list of lint/build diagnostics while retaining the full command output with terminal color codes removed for review and copying.
+- Added Vercel configuration for the Next.js web project, documented the separate persistent API deployment, and removed runtime font downloads.
+- Declared the Next.js ESLint React Hooks plugin directly so clean pnpm installs can complete production linting.
+- Kept Clerk JWKS network refreshes off FastAPI's event loop and ensured MongoDB clients close after metadata write failures.
+- Corrected account documentation to describe automatic claiming of same-browser guest workspaces after sign-in.
+- Fixed Code Intelligence repository context selection to scan the imported workspace root, so review requests can read the intended source tree.
+- Added a plan feedback form that reruns analysis with the requested refinements and saves the revised result as a separate history entry.
+- Added server-paginated, searchable analysis history for signed-in users, with MongoDB aggregation and a filesystem fallback; added retryable, actionable API connection errors in the workspace view.
+- Standardized temporary Gemini `503` handling across task analysis, chat, code review, and implementation draft generation.
+- Added read-only Git branch and changed-path status for imported workspaces; sensitive paths are omitted and no commit or push is performed.
 - Added frontend render smoke coverage and a repeatable standalone web validation plan.
 - Made the API reject apply/rollback requests that do not include explicit confirmation.
 - Hardened Clerk authorized-party validation and kept the frontend in guest mode when only one Clerk key is configured.

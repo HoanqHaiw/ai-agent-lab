@@ -201,7 +201,7 @@ async def create_implementation_draft(workspace_id: str, analysis_id: str) -> di
     )
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL}:generateContent"
     body = {"contents": [{"parts": [{"text": prompt}]}], "generationConfig": {
-        "responseFormat": {"text": {"mimeType": "application/json", "schema": SCHEMA}}, "temperature": 0.1
+        "responseFormat": {"text": {"mimeType": "APPLICATION_JSON", "schema": SCHEMA}}, "temperature": 0.1
     }}
     try:
         status, envelope = await asyncio.wait_for(asyncio.to_thread(_gemini_request, url, api_key, body), timeout=95)
@@ -213,6 +213,8 @@ async def create_implementation_draft(workspace_id: str, analysis_id: str) -> di
         raise WorkspaceError("Gemini free-tier quota is temporarily unavailable. Please try again later.", 429)
     if status in {401, 403}:
         raise WorkspaceError("Gemini rejected the configured API key. Check GEMINI_API_KEY.", 503)
+    if status == 503:
+        raise WorkspaceError("Gemini is temporarily busy. Wait a minute, then generate the draft again.", 503)
     if status >= 400:
         raise WorkspaceError("Gemini could not generate an implementation draft.", 502)
     try:

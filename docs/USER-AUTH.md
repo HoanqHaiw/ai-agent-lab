@@ -16,7 +16,7 @@ Clerk sign-in and registration pages are `/login` and `/register`. The dashboard
 
 Never commit `.env.local` or `.env` files. In production, set `ENVIRONMENT=production` or explicitly set `AUTH_REQUIRED=true`; use the production Clerk instance, a production Google OAuth client, and the deployed web origin in `AUTHORIZED_PARTIES`/`WEB_ORIGIN`.
 
-Existing guest workspaces have no owner. After enabling required authentication, sign in and import those repositories again to create user-owned workspaces.
+Guest workspace IDs are kept in the originating browser. After sign-in, the app claims those unowned workspaces for the signed-in account on the next workspace load. A workspace cannot be claimed from another browser or recovered after its saved ID is cleared; import it again in that case. Signed-in workspaces are listed from MongoDB when configured, while repository files remain on the API host's `WORKSPACE_ROOT`.
 
 ## Provider scope
 

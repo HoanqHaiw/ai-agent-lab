@@ -12,7 +12,10 @@ Send `Authorization: Bearer <Clerk session token>` when signed in. The API verif
 |---|---|---|
 | `GET` | `/` | Service information and links to API docs and health. |
 | `GET` | `/health` | Process health only; it does not check MongoDB, Gemini, Git, or Docker readiness. |
+| `GET` | `/ready` | Dependency readiness summary without returning credentials; checks workspace storage and configured MongoDB, and reports Gemini, Clerk, Git, and Docker availability. |
 | `GET` | `/api/workspaces` | List unexpired workspaces owned by the authenticated user. Guest mode returns an empty list to avoid disclosing anonymous workspaces. |
+| `GET` | `/api/analysis-history?page=1&page_size=10&query=...` | Search and page saved analyses belonging to the authenticated user; page size is limited to 50. |
+| `POST` | `/api/workspaces/{workspace_id}/claim` | Link an unowned guest workspace to the signed-in user presenting its saved workspace ID; another user's workspace cannot be claimed. |
 | `POST` | `/api/workspaces/import-zip` | Multipart form upload with a `.zip` field named `file`. |
 | `POST` | `/api/workspaces/import-github` | Import a public GitHub repository. |
 | `GET` | `/api/workspaces/{workspace_id}` | Workspace overview, static project-health signals, and saved analyses, chat, reviews, and implementation state. |
@@ -27,6 +30,7 @@ Send `Authorization: Bearer <Clerk session token>` when signed in. The API verif
 | `POST` | `/api/workspaces/{workspace_id}/code-intelligence/review` | Run and save a bounded read-only static review. |
 | `GET` | `/api/workspaces/{workspace_id}/verification` | List detected checks, blocked checks, dependency policy, and sandbox availability. |
 | `POST` | `/api/workspaces/{workspace_id}/verification` | Run one allowlisted check by its returned `check_id`. |
+| `GET` | `/api/workspaces/{workspace_id}/git/status` | Read the workspace branch and changed paths; sensitive paths are omitted. |
 
 ### Request examples
 
@@ -55,6 +59,7 @@ Errors use a JSON `detail` string and an HTTP status. Common statuses include `4
 - ZIP limits: 50 MB compressed, 200 MB extracted, 10,000 entries.
 - GitHub imports accept public `github.com/owner/repository` URLs; checked-out supported files are limited to 200 MB and 10,000 entries.
 - Source previews are limited to safe UTF-8 files up to 1 MB. AI requests contain bounded text snippets and validated file/line references, not the full repository.
-- Workspace metadata may be stored in MongoDB. Repository files and implementation drafts remain on the API filesystem in `WORKSPACE_ROOT`; they expire after seven days.
+- Workspace metadata may be stored in MongoDB. Repository files, implementation drafts, and Git worktrees remain on the API filesystem in `WORKSPACE_ROOT`. Guest workspaces expire after seven days; signed-in workspaces do not expire automatically.
+- Production startup requires `ENVIRONMENT=production`, `AUTH_REQUIRED=true`, `CLERK_ISSUER`, `MONGODB_URI`, and an explicit writable `WORKSPACE_ROOT` mounted to durable storage. The API pings MongoDB and creates an owner/list index before serving requests.
 - The authenticated workspace list is loaded from the API and filtered by owner. Guest browsers remember only their own workspace IDs locally; the API never enumerates guest workspaces. MongoDB alone does not make repository files available across API instances.
 - Imported code is not executed during import, analysis, chat, or review. Verification requires an explicit request and runs in Docker. See [MVP flow and security boundaries](./MVP-FLOW.md) for package-manager and network restrictions.

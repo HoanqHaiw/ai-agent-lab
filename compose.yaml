@@ -1,0 +1,13 @@
+# Local development database only. Production must use a secured MongoDB service.
+services:
+  mongo:
+    image: mongo:8.0
+    container_name: ai-agent-lab-mongo
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:27017:27017"
+    volumes:
+      - mongo_data:/data/db
+
+volumes:
+  mongo_data:

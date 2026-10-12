@@ -2,11 +2,21 @@
 
 import { ChangeEvent, FormEvent, useEffect, useState } from "react";
 import { useCallback, type ReactNode } from "react";
-import { UserButton, useAuth } from "@clerk/nextjs";
+import { SignOutButton, UserButton, useAuth, useUser } from "@clerk/nextjs";
 import Link from "next/link";
 
 type ApiFetch = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
-const localApiFetch: ApiFetch = (input, init) => fetch(input, init);
+function apiTransportError(input: RequestInfo | URL): Error {
+  const address = input instanceof Request ? input.url : String(input);
+  let origin = "configured API";
+  try { origin = new URL(address, window.location.href).origin; } catch { /* Keep the safe fallback. */ }
+  return new Error(`Could not reach the Agent Lab API at ${origin}. Confirm the API server is running and the address is reachable from this browser.`);
+}
+
+async function localApiFetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
+  try { return await fetch(input, init); }
+  catch (cause) { if (cause instanceof TypeError) throw apiTransportError(input); throw cause; }
+}
 
 type Workspace = {
   id: string;
@@ -79,7 +89,7 @@ function rememberGuestWorkspace(id: string) {
   }
 }
 
-type Screen = "home" | "project" | "analysis" | "history" | "chat" | "intelligence" | "verification";
+type Screen = "home" | "project" | "analysis" | "history" | "chat" | "intelligence" | "verification" | "git" | "settings";
 type ImportSource = "github" | "zip" | null;
 type TaskAnalysis = {
   task_summary: string;
@@ -109,6 +119,13 @@ const planSteps = [
   { title: "Cover missing and duplicate products", detail: "Add regression cases for unavailable items and repeated product IDs.", tag: "Verification" },
 ];
 
+const taskPromptSuggestions = [
+  "Explain how this repository is organized and identify its main entry points.",
+  "Choose a user-facing feature this repository can actually trace. Explain its flow with evidence and list anything unverified as an open question.",
+  "Find one concrete bug risk and propose a small, safe fix with a way to verify it.",
+  "Identify important behavior that lacks tests and suggest focused regression cases.",
+];
+
 export default function AgentLab({ clerkConfigured }: { clerkConfigured: boolean }) {
   return clerkConfigured
     ? <AuthenticatedAgentLab />
@@ -116,14 +133,54 @@ export default function AgentLab({ clerkConfigured }: { clerkConfigured: boolean
 }
 
 function AuthenticatedAgentLab() {
-  const { getToken } = useAuth();
+  const { getToken, isLoaded, isSignedIn } = useAuth();
   const apiFetch = useCallback<ApiFetch>(async (input, init = {}) => {
-    const token = await getToken();
+    let token: string | null;
+    try { token = await getToken(); }
+    catch (cause) {
+      if (cause instanceof TypeError) throw new Error("Could not refresh your Clerk session token. Check the browser connection to your Clerk instance, then sign in again.");
+      throw cause;
+    }
     const headers = new Headers(init.headers);
     if (token) headers.set("Authorization", `Bearer ${token}`);
-    return fetch(input, { ...init, headers });
+    let response: Response;
+    try { response = await fetch(input, { ...init, headers }); }
+    catch (cause) { if (cause instanceof TypeError) throw apiTransportError(input); throw cause; }
+    if (response.status !== 401) return response;
+
+    // A cached Clerk token can be stale after a page reload or a long-lived tab.
+    // Refresh once and retry; the API rejects unauthorized requests before handling them.
+    let freshToken: string | null;
+    try { freshToken = await getToken({ skipCache: true }); }
+    catch (cause) {
+      if (cause instanceof TypeError) throw new Error("Could not refresh your Clerk session token. Check the browser connection to your Clerk instance, then sign in again.");
+      throw cause;
+    }
+    if (!freshToken || freshToken === token) return response;
+    headers.set("Authorization", `Bearer ${freshToken}`);
+    try { return await fetch(input, { ...init, headers }); }
+    catch (cause) { if (cause instanceof TypeError) throw apiTransportError(input); throw cause; }
   }, [getToken]);
-  return <AgentLabWorkspace apiFetch={apiFetch} authenticated accountSlot={<UserButton />} />;
+
+  // Do not start workspace API requests until Clerk has restored the browser session.
+  if (!isLoaded) return <div className="auth-loading" role="status">Restoring your sign-in session…</div>;
+  if (!isSignedIn) return <div className="auth-loading" role="status">Sign in to open your workspaces.</div>;
+
+  return <AgentLabWorkspace apiFetch={apiFetch} authenticated accountSlot={<SignedInAccount />} />;
+}
+
+function SignedInAccount() {
+  const { user } = useUser();
+  const displayName = user?.fullName || user?.primaryEmailAddress?.emailAddress || "Signed-in account";
+  return (
+    <div className="profile-account">
+      <UserButton />
+      <div className="profile-copy"><strong title={displayName}>{displayName}</strong><small>Signed in</small></div>
+      <SignOutButton redirectUrl="/login">
+        <button className="profile-signout" type="button">Sign out</button>
+      </SignOutButton>
+    </div>
+  );
 }
 
 function AgentLabWorkspace({ apiFetch, authenticated, accountSlot }: { apiFetch: ApiFetch; authenticated: boolean; accountSlot: ReactNode }) {
@@ -133,6 +190,7 @@ function AgentLabWorkspace({ apiFetch, authenticated, accountSlot }: { apiFetch:
   const [activeWorkspace, setActiveWorkspace] = useState<Workspace>(emptyWorkspace);
   const [workspacesLoading, setWorkspacesLoading] = useState(true);
   const [workspaceLoadError, setWorkspaceLoadError] = useState("");
+  const [workspaceReloadKey, setWorkspaceReloadKey] = useState(0);
   const [repoUrl, setRepoUrl] = useState("");
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [importError, setImportError] = useState("");
@@ -156,6 +214,7 @@ function AgentLabWorkspace({ apiFetch, authenticated, accountSlot }: { apiFetch:
     setWorkspacesLoading(true);
     setWorkspaceLoadError("");
     const apiBase = process.env.NEXT_PUBLIC_API_BASE_URL || "http://localhost:8000";
+    let guestClaimWarning = false;
     async function loadWorkspaces() {
       if (!authenticated) {
         let savedIds: unknown;
@@ -179,6 +238,36 @@ function AgentLabWorkspace({ apiFetch, authenticated, accountSlot }: { apiFetch:
         return restored.filter((item): item is Workspace => item !== null);
       }
 
+      let guestIds: string[] = [];
+      try {
+        const savedIds: unknown = JSON.parse(window.localStorage.getItem("agent-lab.guest-workspace-ids") || "[]");
+        if (Array.isArray(savedIds)) {
+          guestIds = savedIds
+            .filter((id): id is string => typeof id === "string" && /^[0-9a-f-]{36}$/i.test(id))
+            .slice(0, 20);
+        }
+      } catch {
+        // A malformed guest list must not prevent signed-in workspaces from loading.
+      }
+      if (guestIds.length > 0) {
+        await Promise.all(guestIds.map(async (id) => {
+          const claimResponse = await apiFetch(`${apiBase}/api/workspaces/${id}/claim`, { method: "POST" });
+          if (claimResponse.status === 409) {
+            guestClaimWarning = true;
+            return;
+          }
+          if ([404, 410].includes(claimResponse.status)) return;
+          if (!claimResponse.ok) {
+            const payload: unknown = await claimResponse.json().catch(() => null);
+            const detail = typeof payload === "object" && payload !== null && "detail" in payload
+              ? String(payload.detail)
+              : "Could not save a guest workspace to your account.";
+            throw new Error(detail);
+          }
+        }));
+        window.localStorage.removeItem("agent-lab.guest-workspace-ids");
+      }
+
       const response = await apiFetch(`${apiBase}/api/workspaces`);
       const payload: unknown = await response.json();
       if (!response.ok) {
@@ -197,6 +286,7 @@ function AgentLabWorkspace({ apiFetch, authenticated, accountSlot }: { apiFetch:
         if (cancelled) return;
         setWorkspaces(restored);
         setActiveWorkspace(restored[0] || emptyWorkspace);
+        if (guestClaimWarning) setWorkspaceLoadError("Some guest workspaces were not linked because they already belong to another account.");
       })
       .catch((cause) => {
         if (!cancelled) setWorkspaceLoadError(cause instanceof Error ? cause.message : "Could not load saved workspaces.");
@@ -205,7 +295,7 @@ function AgentLabWorkspace({ apiFetch, authenticated, accountSlot }: { apiFetch:
         if (!cancelled) setWorkspacesLoading(false);
       });
     return () => { cancelled = true; };
-  }, [apiFetch, authenticated]);
+  }, [apiFetch, authenticated, workspaceReloadKey]);
 
   function openImport(nextSource: Exclude<ImportSource, null>) {
     setSource(nextSource);
@@ -284,10 +374,35 @@ function AgentLabWorkspace({ apiFetch, authenticated, accountSlot }: { apiFetch:
     }
   }
 
-  async function startAnalysis(event: FormEvent<HTMLFormElement>) {
+  async function removeWorkspace(workspace: Workspace) {
+    const apiBase = process.env.NEXT_PUBLIC_API_BASE_URL || "http://localhost:8000";
+    const response = await apiFetch(`${apiBase}/api/workspaces/${workspace.id}`, { method: "DELETE" });
+    if (!response.ok) {
+      const payload: unknown = await response.json().catch(() => null);
+      const detail = typeof payload === "object" && payload !== null && "detail" in payload
+        ? String(payload.detail)
+        : "Could not delete this workspace.";
+      throw new Error(detail);
+    }
+    setWorkspaces((items) => items.filter((item) => item.id !== workspace.id));
+    setActiveWorkspace((item) => item.id === workspace.id ? emptyWorkspace : item);
+    try {
+      const saved: unknown = JSON.parse(window.localStorage.getItem("agent-lab.guest-workspace-ids") || "[]");
+      if (Array.isArray(saved)) {
+        window.localStorage.setItem("agent-lab.guest-workspace-ids", JSON.stringify(saved.filter((id) => id !== workspace.id)));
+      }
+    } catch {
+      // The backend deletion is complete even if browser cleanup is unavailable.
+    }
+  }
+
+  function startAnalysis(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (!task.trim()) return;
-    const submittedTask = task.trim();
+    void runAnalysis(task.trim());
+  }
+
+  async function runAnalysis(submittedTask: string) {
+    if (!submittedTask) return;
     setAnalysisTask(submittedTask);
     setApproved(false);
     setActiveTab("plan");
@@ -323,6 +438,15 @@ function AgentLabWorkspace({ apiFetch, authenticated, accountSlot }: { apiFetch:
     } finally {
       setAnalysisLoading(false);
     }
+  }
+
+  function refineCurrentAnalysis(feedback: string) {
+    const revisedTask = `${analysisTask}\n\nAdditional feedback for the revised plan:\n${feedback.trim()}`;
+    if (revisedTask.length > 4000) {
+      setAnalysisError("The original request and feedback together exceed the 4,000 character limit. Shorten the feedback and try again.");
+      return;
+    }
+    void runAnalysis(revisedTask);
   }
 
   function openWorkspace(workspace: Workspace) {
@@ -416,24 +540,26 @@ function AgentLabWorkspace({ apiFetch, authenticated, accountSlot }: { apiFetch:
         <a className="brand" href="#home" onClick={() => setScreen("home")} aria-label="Agent Lab home"><span className="brand-mark">✳</span><span>agent<span className="brand-light">lab</span></span></a>
         <div className="side-label">WORKSPACE</div>
         <button className={`nav-item ${screen === "home" ? "active" : ""}`} onClick={() => setScreen("home")}><span className="nav-icon">⌂</span>Overview</button>
-        <button className={`nav-item ${screen === "project" || screen === "verification" ? "active" : ""}`} onClick={() => setScreen("home")}><span className="nav-icon">▧</span>Repositories</button>
+        <button className={`nav-item ${screen === "project" || screen === "verification" || screen === "git" ? "active" : ""}`} onClick={() => setScreen("home")}><span className="nav-icon">▧</span>Repositories</button>
         <button className={`nav-item ${screen === "chat" ? "active" : ""}`} onClick={() => setScreen("chat")}><span className="nav-icon">✧</span>Developer chat</button>
         <button className={`nav-item ${screen === "intelligence" ? "active" : ""}`} onClick={() => setScreen("intelligence")}><span className="nav-icon">⌕</span>Code intelligence</button>
         <button className={`nav-item ${screen === "history" ? "active" : ""}`} onClick={() => setScreen("history")}><span className="nav-icon">◷</span>Analysis history</button>
+        <button className={`nav-item ${screen === "settings" ? "active" : ""}`} onClick={() => setScreen("settings")}><span className="nav-icon">⚙</span>System status</button>
         <div className="sidebar-bottom"><div className="provider-card"><span className="status-dot" /><div><strong>Gemini API</strong><small>Key stays on backend</small></div><span className="chevron">⌄</span></div><div className="profile">{accountSlot || <><div className="avatar">G</div><div><strong>Guest</strong><small>Local demo mode</small></div><Link className="profile-auth-link" href="/login">Sign in</Link></>}</div></div>
       </aside>
 
       <section className="main-panel">
-        <header className="topbar"><div className="breadcrumb"><button onClick={() => setScreen("home")}>Workspace</button><span>/</span>{screen === "home" ? "Overview" : screen === "history" ? "Analysis history" : <><button onClick={() => setScreen("project")}>{activeWorkspace.name}</button><span>/</span>{screen === "project" ? "Project overview" : screen === "chat" ? "Developer chat" : screen === "intelligence" ? "Code intelligence" : screen === "verification" ? "Verification" : "Task analysis"}</>}</div><div className="top-actions"><span className="demo-chip"><span className="tiny-dot blue-dot" /> INTERACTIVE PREVIEW</span><button className="help-button" aria-label="Help" onClick={() => showToast("This is a preview with an API-connected analysis flow.")}>?</button></div></header>
+        <header className="topbar"><div className="breadcrumb"><button onClick={() => setScreen("home")}>Workspace</button><span>/</span>{screen === "home" ? "Overview" : screen === "history" ? "Analysis history" : screen === "settings" ? "System status" : <><button onClick={() => setScreen("project")}>{activeWorkspace.name}</button><span>/</span>{screen === "project" ? "Project overview" : screen === "chat" ? "Developer chat" : screen === "intelligence" ? "Code intelligence" : screen === "verification" ? "Verification" : screen === "git" ? "Git status" : "Task analysis"}</>}</div><div className="top-actions"><span className="demo-chip"><span className="tiny-dot blue-dot" /> INTERACTIVE PREVIEW</span><button className="help-button" aria-label="Help" onClick={() => showToast("This is a preview with an API-connected analysis flow.")}>?</button></div></header>
         <div className="content">
-          {workspaceLoadError && <p className="form-error" role="alert">{workspaceLoadError}</p>}
-          {screen === "home" && <HomeScreen workspaces={workspaces} loading={workspacesLoading} onImport={openImport} onOpen={openWorkspace} />}
-          {screen === "project" && <ProjectScreen workspace={activeWorkspace} task={task} onTaskChange={setTask} onAnalyze={startAnalysis} onBack={() => setScreen("home")} onOpenChat={() => setScreen("chat")} onRunReview={() => setScreen("intelligence")} onRunVerification={() => setScreen("verification")} />}
-          {screen === "analysis" && <AnalysisScreen apiFetch={apiFetch} workspace={activeWorkspace} analysisId={analysisRecordId} draftId={implementationDraftId} implementationStatus={implementationStatus} onDraftCreated={rememberImplementationDraft} onImplementationChanged={updateImplementationState} task={analysisTask} result={analysisResult} error={analysisError} loading={analysisLoading} approved={approved} approvalLoading={approvalLoading} approvalError={approvalError} activeTab={activeTab} onTab={setActiveTab} onApprove={() => void approveCurrentPlan()} onBack={() => setScreen("project")} />}
+          {screen === "home" && <HomeScreen workspaces={workspaces} loading={workspacesLoading} loadError={workspaceLoadError} onRetry={() => setWorkspaceReloadKey((value) => value + 1)} onImport={openImport} onOpen={openWorkspace} onDelete={removeWorkspace} />}
+          {screen === "project" && <ProjectScreen workspace={activeWorkspace} task={task} onTaskChange={setTask} onAnalyze={startAnalysis} onBack={() => setScreen("home")} onOpenChat={() => setScreen("chat")} onRunReview={() => setScreen("intelligence")} onRunVerification={() => setScreen("verification")} onOpenGit={() => setScreen("git")} />}
+          {screen === "analysis" && <AnalysisScreen apiFetch={apiFetch} workspace={activeWorkspace} analysisId={analysisRecordId} draftId={implementationDraftId} implementationStatus={implementationStatus} onDraftCreated={rememberImplementationDraft} onImplementationChanged={updateImplementationState} onRefine={refineCurrentAnalysis} task={analysisTask} result={analysisResult} error={analysisError} loading={analysisLoading} approved={approved} approvalLoading={approvalLoading} approvalError={approvalError} activeTab={activeTab} onTab={setActiveTab} onApprove={() => void approveCurrentPlan()} onBack={() => setScreen("project")} />}
           {screen === "chat" && <ChatScreen key={activeWorkspace.id} apiFetch={apiFetch} workspace={activeWorkspace} onBack={() => setScreen("project")} onMessagesChanged={(messages) => updateChatMessages(activeWorkspace.id, messages)} />}
           {screen === "intelligence" && <CodeIntelligenceScreen key={activeWorkspace.id} apiFetch={apiFetch} workspace={activeWorkspace} onBack={() => setScreen("project")} onReviewsChanged={(reviews) => updateCodeReviews(activeWorkspace.id, reviews)} />}
           {screen === "verification" && <VerificationScreen key={activeWorkspace.id} apiFetch={apiFetch} workspace={activeWorkspace} onBack={() => setScreen("project")} />}
-          {screen === "history" && <HistoryScreen workspaces={workspaces} onOpen={openAnalysis} />}
+          {screen === "git" && <GitStatusScreen key={activeWorkspace.id} apiFetch={apiFetch} workspace={activeWorkspace} onBack={() => setScreen("project")} />}
+          {screen === "history" && <HistoryScreen apiFetch={apiFetch} authenticated={authenticated} workspaces={workspaces} loading={workspacesLoading} onOpen={openAnalysis} />}
+          {screen === "settings" && <SystemStatusScreen apiFetch={apiFetch} />}
         </div>
       </section>
 
@@ -443,7 +569,85 @@ function AgentLabWorkspace({ apiFetch, authenticated, accountSlot }: { apiFetch:
   );
 }
 
-function HomeScreen({ workspaces, loading, onImport, onOpen }: { workspaces: Workspace[]; loading: boolean; onImport: (source: Exclude<ImportSource, null>) => void; onOpen: (workspace: Workspace) => void }) {
+type Readiness = { status: string; service: string; dependencies: Record<string, string> };
+
+function SystemStatusScreen({ apiFetch }: { apiFetch: ApiFetch }) {
+  const [readiness, setReadiness] = useState<Readiness | null>(null);
+  const [error, setError] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [reloadKey, setReloadKey] = useState(0);
+
+  useEffect(() => {
+    let cancelled = false;
+    const apiBase = process.env.NEXT_PUBLIC_API_BASE_URL || "http://localhost:8000";
+    setLoading(true);
+    setError("");
+    void apiFetch(`${apiBase}/ready`)
+      .then(async (response) => {
+        const payload: unknown = await response.json();
+        if (!response.ok && response.status !== 503) throw new Error("The API readiness endpoint could not be read.");
+        if (typeof payload !== "object" || payload === null || !("dependencies" in payload)) throw new Error("The API returned an invalid readiness report.");
+        if (!cancelled) setReadiness(payload as Readiness);
+      })
+      .catch((cause) => { if (!cancelled) setError(cause instanceof Error ? cause.message : "Could not check API readiness."); })
+      .finally(() => { if (!cancelled) setLoading(false); });
+    return () => { cancelled = true; };
+  }, [apiFetch, reloadKey]);
+
+  const dependencies = readiness?.dependencies || {};
+  const labels: Record<string, string> = {
+    workspace_storage: "Workspace storage",
+    mongodb: "MongoDB Atlas",
+    gemini: "Gemini analysis",
+    clerk: "Clerk authentication",
+    git: "Git",
+    docker: "Docker verification",
+  };
+  const statusLabel = (value: string) => value === "ready" || value === "available" || value === "configured"
+    ? "Ready"
+    : value === "not_configured" ? "Not configured" : "Unavailable";
+
+  return <div className="screen-stack system-status-screen">
+    <div className="intelligence-title-row"><div><div className="eyebrow"><span className="eyebrow-line" /> SYSTEM STATUS</div><h1 className="screen-title">System health</h1><p className="screen-subtitle">Check API dependencies and the services used by your workspaces.</p></div><button className="secondary-button" onClick={() => setReloadKey((key) => key + 1)} disabled={loading}>{loading ? "Checking…" : "Refresh status"}<span>↻</span></button></div>
+    {error && <div className="workspace-load-error" role="alert">{error}<button onClick={() => setReloadKey((key) => key + 1)}>Try again</button></div>}
+    {readiness && <>
+      <section className={`panel-card readiness-summary ${readiness.status === "ready" ? "is-ready" : "is-degraded"}`}><span className="readiness-indicator" aria-hidden="true">{readiness.status === "ready" ? "✓" : "!"}</span><div><strong>{readiness.status === "ready" ? "API is ready" : "Some services need attention"}</strong><p>{readiness.service} · Health endpoint checks process availability; this page checks configured dependencies.</p></div></section>
+      <section className="readiness-grid" aria-label="Dependency status">{Object.entries(labels).map(([key, label]) => {
+        const value = dependencies[key] || "not_configured";
+        const ready = ["ready", "available", "configured"].includes(value);
+        return <article className="panel-card readiness-card" key={key}><div className={`readiness-dot ${ready ? "ready" : "attention"}`} /><div><h2>{label}</h2><p>{statusLabel(value)}</p></div><span className="readiness-value">{value.replaceAll("_", " ")}</span></article>;
+      })}</section>
+      <p className="readiness-note">This report does not include credentials or database URLs. “Not configured” may be expected for optional services in local development.</p>
+    </>}
+    {!readiness && loading && <div className="panel-card readiness-loading" role="status">Checking API and dependencies…</div>}
+  </div>;
+}
+
+function HomeScreen({ workspaces, loading, loadError, onRetry, onImport, onOpen, onDelete }: { workspaces: Workspace[]; loading: boolean; loadError: string; onRetry: () => void; onImport: (source: Exclude<ImportSource, null>) => void; onOpen: (workspace: Workspace) => void; onDelete: (workspace: Workspace) => Promise<void> }) {
+  const [page, setPage] = useState(1);
+  const [pendingDelete, setPendingDelete] = useState<Workspace | null>(null);
+  const [deleteError, setDeleteError] = useState("");
+  const [deleting, setDeleting] = useState(false);
+  const pageSize = 8;
+  const pageCount = Math.max(1, Math.ceil(workspaces.length / pageSize));
+  const visibleWorkspaces = workspaces.slice((page - 1) * pageSize, page * pageSize);
+
+  useEffect(() => setPage((current) => Math.min(current, pageCount)), [pageCount]);
+
+  async function confirmDelete() {
+    if (!pendingDelete || deleting) return;
+    setDeleting(true);
+    setDeleteError("");
+    try {
+      await onDelete(pendingDelete);
+      setPendingDelete(null);
+    } catch (cause) {
+      setDeleteError(cause instanceof Error ? cause.message : "Could not delete this workspace.");
+    } finally {
+      setDeleting(false);
+    }
+  }
+
   return <>
     <div className="welcome-row"><div><div className="eyebrow"><span className="eyebrow-line" /> YOUR ENGINEERING COPILOT</div><h1>Understand the task.<br /><span>Then write the code.</span></h1><p className="intro">Give Agent Lab a repository and a handoff. Get a clear, evidence-backed plan before implementation begins.</p></div><div className="hero-orbit" aria-hidden="true"><div className="orbit orbit-one" /><div className="orbit orbit-two" /><div className="orbit-core">✳</div><span className="orbit-node node-a">⌘</span><span className="orbit-node node-b">{ }</span><span className="orbit-node node-c">↗</span></div></div>
     <div className="section-heading"><div><h2>Start with a repository</h2><p>Choose where your project lives. Both options lead to the same analysis flow.</p></div><span className="step-pill"><span>01</span> CREATE WORKSPACE</span></div>
@@ -452,28 +656,124 @@ function HomeScreen({ workspaces, loading, onImport, onOpen }: { workspaces: Wor
       <button className="source-card" type="button" onClick={() => onImport("zip")}><span className="source-icon upload-icon"><UploadIcon /></span><span className="source-copy"><strong>Upload a project</strong><span>Bring a local project as a ZIP file</span></span><span className="source-arrow">↗</span><span className="source-foot"><span className="tiny-dot blue-dot" /> ZIP files up to 50 MB</span></button>
     </div>
     <div className="how-row"><div className="how-icon">✦</div><div><strong>From handoff to a confident plan</strong><span>Agent Lab maps your code, traces the task to relevant files, and shows its evidence.</span></div><a href="#how-it-works">How the demo works <span>→</span></a></div>
-    <section className="recent-section"><div className="section-heading recent-heading"><div><h2>Recent workspaces</h2><p>Pick up where you left off.</p></div><button className="view-all" onClick={() => onImport("github")}>New workspace <span>＋</span></button></div><div className="workspace-list">{loading ? <p className="intelligence-empty">Loading saved workspaces…</p> : workspaces.length ? workspaces.map((workspace, index) => <button className="workspace-row" onClick={() => onOpen(workspace)} key={workspace.id}><span className={`repo-avatar ${index % 2 ? "blue" : "violet"}`}>{workspace.name.slice(0, 2).toUpperCase()}</span><span className="repo-info"><strong>{workspace.name}</strong><small>{workspace.source} · {workspace.detail}</small></span><span className="repo-status"><span className="tiny-dot green" /> Ready</span><span className="row-arrow">→</span></button>) : <p className="intelligence-empty">No saved workspaces yet. Import a repository to get started.</p>}</div></section>
+    <section className="recent-section"><div className="section-heading recent-heading"><div><h2>Workspaces</h2><p>{workspaces.length ? `${workspaces.length} saved ${workspaces.length === 1 ? "workspace" : "workspaces"}` : "Pick up where you left off."}</p></div><button className="view-all" onClick={() => onImport("github")}>New workspace <span>＋</span></button></div>
+      {loadError && <div className="workspace-load-error" role="alert"><span>{loadError}</span><button type="button" onClick={onRetry} disabled={loading}>{loading ? "Retrying…" : "Try again"}</button></div>}
+      {loading ? <div className="workspace-grid-loading" role="status">Loading saved workspaces…</div> : workspaces.length ? <>
+        <div className="workspace-grid">{visibleWorkspaces.map((workspace, index) => <article className="workspace-card" key={workspace.id}>
+          <button className="workspace-open" type="button" onClick={() => onOpen(workspace)} aria-label={`Open ${workspace.name}`}>
+            <span className={`repo-avatar ${index % 2 ? "blue" : "violet"}`}>{workspace.name.slice(0, 2).toUpperCase()}</span>
+            <span className="repo-info"><strong title={workspace.name}>{workspace.name}</strong><small>{workspace.source} · {workspace.detail}</small></span>
+            <span className="row-arrow" aria-hidden="true">→</span>
+          </button>
+          <div className="workspace-card-footer"><span className="repo-status"><span className="tiny-dot green" /> Ready</span><button className="workspace-delete" type="button" onClick={() => { setPendingDelete(workspace); setDeleteError(""); }}>Delete</button></div>
+        </article>)}</div>
+        {pageCount > 1 && <nav className="workspace-pagination" aria-label="Workspace pages"><span>Page {page} of {pageCount}</span><div><button type="button" onClick={() => setPage((current) => Math.max(1, current - 1))} disabled={page === 1}>Previous</button><button type="button" onClick={() => setPage((current) => Math.min(pageCount, current + 1))} disabled={page === pageCount}>Next</button></div></nav>}
+      </> : loadError ? null : <div className="workspace-empty"><span className="workspace-empty-icon">▧</span><strong>No workspaces yet</strong><p>Import a GitHub repository or upload a ZIP project to get started.</p></div>}
+    </section>
     <footer><span>BUILT FOR THE MOMENT BEFORE THE FIRST COMMIT</span><span>Agent Lab <b>·</b> Interactive preview</span></footer>
+    {pendingDelete && <div className="modal-backdrop" role="presentation"><section className="delete-modal" role="alertdialog" aria-modal="true" aria-labelledby="delete-workspace-title" aria-describedby="delete-workspace-description">
+      <span className="delete-modal-icon" aria-hidden="true">!</span><div className="eyebrow"><span className="eyebrow-line" /> WORKSPACE MANAGEMENT</div><h2 id="delete-workspace-title">Delete this workspace?</h2><p id="delete-workspace-description">“{pendingDelete.name}” and its saved analyses, chats, reviews, and implementation files will be permanently removed.</p>
+      {deleteError && <p className="delete-error" role="alert">{deleteError}</p>}
+      <div className="modal-actions"><button className="cancel-button" type="button" onClick={() => setPendingDelete(null)} disabled={deleting}>Cancel</button><button className="danger-button" type="button" onClick={() => void confirmDelete()} disabled={deleting}>{deleting ? "Deleting…" : "Delete workspace"}</button></div>
+    </section></div>}
   </>;
 }
 
-function HistoryScreen({ workspaces, onOpen }: { workspaces: Workspace[]; onOpen: (workspace: Workspace, record: AnalysisRecord) => void }) {
+function HistoryScreen({ apiFetch, authenticated, workspaces, loading, onOpen }: { apiFetch: ApiFetch; authenticated: boolean; workspaces: Workspace[]; loading: boolean; onOpen: (workspace: Workspace, record: AnalysisRecord) => void }) {
+  const [query, setQuery] = useState("");
+  const [page, setPage] = useState(1);
+  const [remoteItems, setRemoteItems] = useState<Array<{ workspace: Workspace; record: AnalysisRecord }> | null>(null);
+  const [remoteTotal, setRemoteTotal] = useState(0);
+  const [remotePages, setRemotePages] = useState(0);
+  const [remoteLoading, setRemoteLoading] = useState(false);
+  const [remoteError, setRemoteError] = useState("");
+  const [refreshKey, setRefreshKey] = useState(0);
+  const pageSize = 10;
   const entries = workspaces.flatMap((workspace) => (workspace.analyses || []).map((record) => ({ workspace, record })))
-    .sort((left, right) => Date.parse(right.record.created_at) - Date.parse(left.record.created_at));
+    .sort((left, right) => (Date.parse(right.record.created_at) || 0) - (Date.parse(left.record.created_at) || 0));
+  const normalizedQuery = query.trim().toLocaleLowerCase();
+  const filteredEntries = normalizedQuery
+    ? entries.filter(({ workspace, record }) => `${workspace.name} ${record.task}`.toLocaleLowerCase().includes(normalizedQuery))
+    : entries;
+  useEffect(() => {
+    if (!authenticated) return;
+    let cancelled = false;
+    const apiBase = process.env.NEXT_PUBLIC_API_BASE_URL || "http://localhost:8000";
+    const params = new URLSearchParams({ page: String(page), page_size: String(pageSize), query });
+    setRemoteLoading(true);
+    setRemoteError("");
+    const timer = window.setTimeout(() => {
+      setRemoteLoading(true);
+      void apiFetch(`${apiBase}/api/analysis-history?${params.toString()}`)
+      .then(async (response) => {
+        const payload: unknown = await response.json();
+        if (!response.ok) {
+          const detail = typeof payload === "object" && payload !== null && "detail" in payload ? String(payload.detail) : "Could not load analysis history.";
+          throw new Error(detail);
+        }
+        if (typeof payload !== "object" || payload === null || !("items" in payload) || !Array.isArray(payload.items)) throw new Error("The API returned an invalid analysis history page.");
+        const data = payload as { items: Array<{ workspace: { id: string; name: string; source: Workspace["source"] }; analysis: AnalysisRecord }>; total: number; total_pages: number };
+        if (!cancelled) {
+          setRemoteItems(data.items.map(({ workspace, analysis }) => ({ workspace: { ...emptyWorkspace, ...workspace, detail: "saved workspace" }, record: analysis })));
+          setRemoteTotal(data.total);
+          setRemotePages(data.total_pages);
+        }
+      })
+      .catch((cause: unknown) => { if (!cancelled) setRemoteError(cause instanceof Error ? cause.message : "Could not load analysis history."); })
+      .finally(() => { if (!cancelled) setRemoteLoading(false); });
+    }, 250);
+    return () => { cancelled = true; window.clearTimeout(timer); };
+  }, [apiFetch, authenticated, page, pageSize, query, refreshKey]);
+
+  const pageCount = authenticated ? Math.max(1, remotePages) : Math.max(1, Math.ceil(filteredEntries.length / pageSize));
+  const currentPage = Math.min(page, pageCount);
+  const visibleEntries = authenticated ? (remoteItems || []) : filteredEntries.slice((currentPage - 1) * pageSize, currentPage * pageSize);
+  const total = authenticated ? remoteTotal : filteredEntries.length;
+  const isLoading = loading || remoteLoading;
+  const rangeStart = total ? (currentPage - 1) * pageSize + 1 : 0;
+  const rangeEnd = Math.min(currentPage * pageSize, total);
+
+  function statusFor(record: AnalysisRecord) {
+    if (record.implementation_status === "applied") return { label: "Changes applied", className: "history-status applied" };
+    if (record.implementation_status === "reverted") return { label: "Changes reverted", className: "history-status neutral" };
+    if (record.implementation_status === "pending_review") return { label: "Draft ready for review", className: "history-status pending" };
+    if (record.implementation_status === "stale") return { label: "Draft needs refresh", className: "history-status pending" };
+    if (record.approved_at) return { label: "Plan approved", className: "history-status approved" };
+    return { label: "Plan saved", className: "history-status neutral" };
+  }
+
+  function formatDate(value: string) {
+    const date = new Date(value);
+    return Number.isNaN(date.getTime()) ? "Date unavailable" : new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" }).format(date);
+  }
+
   return <div className="screen-stack">
     <div className="eyebrow"><span className="eyebrow-line" /> WORKSPACE HISTORY</div>
     <h1 className="screen-title">Analysis history</h1>
-    <p className="screen-subtitle">Previous task plans saved with their repository workspace.</p>
-    {entries.length ? <section className="workspace-list">{entries.map(({ workspace, record }) => <button className="workspace-row" key={`${workspace.id}-${record.id}`} onClick={() => onOpen(workspace, record)}>
-      <span className="repo-avatar violet">✦</span><span className="repo-info"><strong>{workspace.name}</strong><small>{record.task}</small><small>{new Date(record.created_at).toLocaleString()}</small></span><span className="row-arrow">→</span>
-    </button>)}</section> : <section className="panel-card"><h2>No saved analyses yet</h2><p className="overview-copy">Import a repository and analyze a task. Its result will appear here and remain available with that workspace.</p></section>}
+    <p className="screen-subtitle">Find a previous task plan and reopen it with its repository evidence.</p>
+    {remoteError ? <section className="panel-card history-empty" role="alert"><h2>Could not load analysis history</h2><p>{remoteError}</p><button className="text-button" type="button" onClick={() => setRefreshKey((value) => value + 1)}>Try again</button></section> : isLoading ? <section className="panel-card history-empty" role="status">Loading saved analysis history…</section> : total ? <>
+      <section className="panel-card history-panel" aria-label="Saved analyses">
+        <div className="history-toolbar"><div><strong>{total} {total === 1 ? "saved analysis" : "saved analyses"}</strong><small>Across your saved workspaces</small></div><label className="history-search"><span aria-hidden="true">⌕</span><input type="search" value={query} onChange={(event) => { setQuery(event.target.value); setPage(1); }} placeholder="Search repositories or tasks" aria-label="Search analysis history" />{query && <button type="button" onClick={() => { setQuery(""); setPage(1); }} aria-label="Clear search">×</button>}</label></div>
+        {remoteLoading && <div className="history-loading-inline" role="status">Updating results…</div>}
+        {visibleEntries.length ? <div className="history-list">{visibleEntries.map(({ workspace, record }) => {
+          const status = statusFor(record);
+          return <button className="history-entry" type="button" key={`${workspace.id}-${record.id}`} onClick={() => onOpen(workspace, record)}>
+            <span className="repo-avatar violet" aria-hidden="true">✦</span>
+            <span className="history-entry-copy"><strong title={workspace.name}>{workspace.name}</strong><span className="history-task" title={record.task}>{record.task}</span><span className="history-entry-meta"><time dateTime={record.created_at}>{formatDate(record.created_at)}</time><span className={status.className}>{status.label}</span></span></span>
+            <span className="row-arrow" aria-hidden="true">→</span>
+          </button>;
+        })}</div> : <div className="history-empty history-no-results"><strong>No matching analyses</strong><p>Try a different repository name or task phrase.</p><button type="button" className="text-button" onClick={() => { setQuery(""); setPage(1); }}>Clear search</button></div>}
+        {total > 0 && <div className="history-pagination"><span>Showing {rangeStart}–{rangeEnd} of {total}</span><div><button type="button" onClick={() => setPage((value) => Math.max(1, value - 1))} disabled={currentPage === 1}>Previous</button><span>Page {currentPage} of {pageCount}</span><button type="button" onClick={() => setPage((value) => Math.min(pageCount, value + 1))} disabled={currentPage === pageCount}>Next</button></div></div>}
+      </section>
+      <p className="history-retention-note">History currently includes the 20 most recent analyses saved for each workspace.</p>
+    </> : <section className="panel-card history-empty"><span className="history-empty-icon" aria-hidden="true">◷</span><h2>{query ? "No matching analyses" : "No saved analyses yet"}</h2><p>{query ? "Try a different repository name or task phrase." : "Analyze a task in any workspace. Its plan and cited files will appear here and can be reopened later."}</p></section>}
   </div>;
 }
 
-function ProjectScreen({ workspace, task, onTaskChange, onAnalyze, onBack, onOpenChat, onRunReview, onRunVerification }: { workspace: Workspace; task: string; onTaskChange: (task: string) => void; onAnalyze: (event: FormEvent<HTMLFormElement>) => void; onBack: () => void; onOpenChat: () => void; onRunReview: () => void; onRunVerification: () => void }) {
+function ProjectScreen({ workspace, task, onTaskChange, onAnalyze, onBack, onOpenChat, onRunReview, onRunVerification, onOpenGit }: { workspace: Workspace; task: string; onTaskChange: (task: string) => void; onAnalyze: (event: FormEvent<HTMLFormElement>) => void; onBack: () => void; onOpenChat: () => void; onRunReview: () => void; onRunVerification: () => void; onOpenGit: () => void }) {
   return <div className="screen-stack">
     <div className="screen-back"><button onClick={onBack}>← All workspaces</button><span className="demo-label">{workspace.projectOverview ? "IMPORTED REPOSITORY" : "SAMPLE PROJECT DATA"}</span></div>
-    <div className="project-title-row"><div><div className="eyebrow"><span className="eyebrow-line" /> PROJECT OVERVIEW</div><h1 className="screen-title">{workspace.name}</h1><p className="screen-subtitle">{workspace.source} workspace · Repository analysis preview</p></div><div className="project-actions"><span className="ready-pill"><span className="tiny-dot green" /> Indexed</span><button className="secondary-button" onClick={onRunReview}>Review code <span>⌕</span></button><button className="secondary-button" onClick={onRunVerification}>Run checks <span>✓</span></button><button className="primary-button" onClick={onOpenChat}>Ask about this project <span>→</span></button></div></div>
+    <div className="project-title-row"><div><div className="eyebrow"><span className="eyebrow-line" /> PROJECT OVERVIEW</div><h1 className="screen-title">{workspace.name}</h1><p className="screen-subtitle">{workspace.source} workspace · Repository analysis preview</p></div><div className="project-actions"><span className="ready-pill"><span className="tiny-dot green" /> Indexed</span><button className="secondary-button" onClick={onOpenGit} disabled={!/^[0-9a-f]{8}-[0-9a-f-]{27,}$/i.test(workspace.id)} title="Available for imported workspaces">Git status <span>⌘</span></button><button className="secondary-button" onClick={onRunReview}>Review code <span>⌕</span></button><button className="secondary-button" onClick={onRunVerification}>Run checks <span>✓</span></button><button className="primary-button" onClick={onOpenChat}>Ask about this project <span>→</span></button></div></div>
     <div className="project-stats"><div><span>TECH STACK</span><strong>{workspace.projectOverview?.technologies.length ? workspace.projectOverview.technologies.slice(0, 3).join(" · ") : workspace.projectOverview ? "No framework detected" : "TypeScript · React · Node.js (sample)"}</strong></div><div><span>FILES DISCOVERED</span><strong>{workspace.fileCount ? `${workspace.fileCount} files` : "128 files (sample)"}</strong></div><div><span>SOURCE LANGUAGES</span><strong>{workspace.projectOverview?.languages.slice(0, 2).map((language) => language.name).join(" · ") || (workspace.projectOverview ? "Not detected" : "Sample project")}</strong></div></div>
     <div className="project-columns"><section className="panel-card"><div className="panel-heading"><div><h2>Repository structure</h2><p>{workspace.projectOverview ? "Top-level folders and files" : "Example structure · sample data"}</p></div><span className="panel-dots">···</span></div><div className="tree-list">{workspace.projectOverview ? workspace.projectOverview.top_level.slice(0, 10).map((item) => <div className="tree-row file-path-row" key={item.name}><span className={item.type === "folder" ? "folder-icon" : "file-icon"}>{item.type === "folder" ? "▰" : item.name.split(".").at(-1)?.slice(0, 2).toUpperCase() || "--"}</span><span title={item.name}>{item.name}{item.type === "folder" ? "/" : ""}</span></div>) : workspace.filesPreview ? workspace.filesPreview.slice(0, 6).map((file) => <div className="tree-row file-path-row" key={file}><span className="file-icon">{file.split(".").at(-1)?.slice(0, 2).toUpperCase() || "--"}</span><span title={file}>{file}</span></div>) : <><div className="tree-row"><span>⌄</span><span className="folder-icon">▰</span><strong>src</strong></div><div className="tree-row indent"><span>⌄</span><span className="folder-icon">▰</span><strong>checkout</strong></div><div className="tree-row indent-two"><span className="file-icon">TS</span><span>checkout.service.ts</span><small>148</small></div><div className="tree-row indent"><span>⌄</span><span className="folder-icon">▰</span><strong>products</strong></div><div className="tree-row indent-two"><span className="file-icon">TS</span><span>product.repository.ts</span><small>92</small></div><div className="tree-row"><span>⌄</span><span className="folder-icon">▰</span><strong>tests</strong></div><div className="tree-row indent"><span className="file-icon">TS</span><span>checkout.test.ts</span><small>126</small></div></>}</div><div className="file-preview-list">{workspace.projectOverview && <><div className="list-divider" /><strong className="list-caption">SAMPLE FILE PATHS</strong>{workspace.filesPreview?.slice(0, 5).map((file) => <div className="path-preview" key={file}><span>↳</span>{file}</div>)}</>}</div></section>
       <section className="panel-card overview-card"><div className="panel-heading"><div><h2>Detected technologies</h2><p>{workspace.projectOverview ? "Based on file extensions and manifests" : "Sample overview · placeholder"}</p></div><span className="sparkle">✦</span></div><p className="overview-copy">{workspace.projectOverview?.summary || (workspace.filesPreview ? "Project files imported. No supported language or framework markers were detected." : "A sample Node.js service organized around feature modules. This example shows the intended overview layout.")}</p>{workspace.projectOverview?.languages.length ? <div className="language-list">{workspace.projectOverview.languages.slice(0, 5).map((language) => <div key={language.name}><span>{language.name}</span><strong>{language.files} files</strong><span className="language-meter"><i style={{ width: `${Math.max(8, Math.round(language.files / workspace.projectOverview!.languages[0].files * 100))}%` }} /></span></div>)}</div> : !workspace.projectOverview && <div className="module-chips"><span>Authentication</span><span>Products</span><span>Checkout</span><span>Orders</span></div>}{workspace.projectOverview?.technologies.length ? <div className="module-chips">{workspace.projectOverview.technologies.slice(0, 8).map((technology) => <span key={technology}>{technology}</span>)}</div> : null}<div className="overview-note"><span>i</span> {workspace.projectOverview ? "This is deterministic manifest analysis; AI has not run." : "This sample summary is not based on an imported repository."}</div>{workspace.projectOverview?.manifest_files.length ? <div className="manifest-list"><strong>MANIFESTS</strong>{workspace.projectOverview.manifest_files.slice(0, 4).map((manifest) => <span key={manifest}>{manifest}</span>)}</div> : null}</section></div>
@@ -487,11 +787,11 @@ function ProjectScreen({ workspace, task, onTaskChange, onAnalyze, onBack, onOpe
       </div>
       <p className="intelligence-disclaimer">These are repository indicators, not a full architecture audit. Confirm each finding in its cited files.</p>
     </section>}
-    <form className="task-box" onSubmit={onAnalyze}><div className="task-box-heading"><div className="task-icon">✦</div><div><h2>What task were you handed?</h2><p>Describe the request. Agent Lab will map it to the project and create a plan.</p></div></div><textarea value={task} onChange={(event) => onTaskChange(event.target.value)} placeholder="Example: Checkout sometimes times out when a cart contains many products. Find the bottleneck and suggest a safe fix." rows={3} /><div className="task-box-footer"><span>⌘ ↵ &nbsp; Analyze task</span><button className="primary-button" type="submit" disabled={!task.trim()}>Analyze task <span>→</span></button></div></form>
+    <form className="task-box" onSubmit={onAnalyze}><div className="task-box-heading"><div className="task-icon">✦</div><div><h2>What task were you handed?</h2><p>Describe the request. Agent Lab will map it to the project and create a plan.</p></div></div><textarea value={task} onChange={(event) => onTaskChange(event.target.value)} placeholder="Example: Checkout sometimes times out when a cart contains many products. Find the bottleneck and suggest a safe fix." rows={3} /><div className="task-suggestions"><div className="task-suggestions-heading">Not sure what to ask? Start with one of these</div><div className="task-suggestion-list">{taskPromptSuggestions.map((prompt) => <button key={prompt} type="button" className={`task-suggestion${task === prompt ? " selected" : ""}`} aria-pressed={task === prompt} onClick={() => onTaskChange(prompt)}>{prompt}</button>)}</div></div><div className="task-box-footer"><span>⌘ ↵ &nbsp; Analyze task</span><button className="primary-button" type="submit" disabled={!task.trim()}>Analyze task <span>→</span></button></div></form>
   </div>;
 }
 
-function AnalysisScreen({ apiFetch, workspace, analysisId, draftId, implementationStatus, onDraftCreated, onImplementationChanged, task, result, error, loading, approved, approvalLoading, approvalError, activeTab, onTab, onApprove, onBack }: { apiFetch: ApiFetch; workspace: Workspace; analysisId: string; draftId: string; implementationStatus: string; onDraftCreated: (id: string) => void; onImplementationChanged: (status: "applied" | "reverted") => void; task: string; result: TaskAnalysis | null; error: string; loading: boolean; approved: boolean; approvalLoading: boolean; approvalError: string; activeTab: "plan" | "files"; onTab: (tab: "plan" | "files") => void; onApprove: () => void; onBack: () => void }) {
+function AnalysisScreen({ apiFetch, workspace, analysisId, draftId, implementationStatus, onDraftCreated, onImplementationChanged, onRefine, task, result, error, loading, approved, approvalLoading, approvalError, activeTab, onTab, onApprove, onBack }: { apiFetch: ApiFetch; workspace: Workspace; analysisId: string; draftId: string; implementationStatus: string; onDraftCreated: (id: string) => void; onImplementationChanged: (status: "applied" | "reverted") => void; onRefine: (feedback: string) => void; task: string; result: TaskAnalysis | null; error: string; loading: boolean; approved: boolean; approvalLoading: boolean; approvalError: string; activeTab: "plan" | "files"; onTab: (tab: "plan" | "files") => void; onApprove: () => void; onBack: () => void }) {
   const [preview, setPreview] = useState<EvidencePreview | null>(null);
   const [previewLoading, setPreviewLoading] = useState(false);
   const [previewError, setPreviewError] = useState("");
@@ -500,6 +800,7 @@ function AnalysisScreen({ apiFetch, workspace, analysisId, draftId, implementati
   const [draftError, setDraftError] = useState("");
   const [applyLoading, setApplyLoading] = useState(false);
   const [rollbackLoading, setRollbackLoading] = useState(false);
+  const [planFeedback, setPlanFeedback] = useState("");
   const apiBase = process.env.NEXT_PUBLIC_API_BASE_URL || "http://localhost:8000";
 
   useEffect(() => {
@@ -620,6 +921,7 @@ function AnalysisScreen({ apiFetch, workspace, analysisId, draftId, implementati
         {!!result.verification.length && <div className="evidence-list"><strong>Suggested verification</strong>{result.verification.map((item, index) => <p key={index}>{item}</p>)}</div>}
         <div className="plan-footer"><span>Relevant files <strong>{result.relevant_files.length}</strong></span><button className={approved ? "secondary-button" : "primary-button"} onClick={onApprove} disabled={approved || approvalLoading}>{approvalLoading ? "Saving approval…" : approved ? "Plan approved" : "Approve plan"} <span>{approved ? "✓" : "→"}</span></button></div>
       </section>
+      <form className="panel-card plan-feedback" onSubmit={(event) => { event.preventDefault(); if (!planFeedback.trim() || loading) return; onRefine(planFeedback); setPlanFeedback(""); }}><div><h2>Need a different plan?</h2><p>Describe what is missing or what should change. Agent Lab will analyze it again and save a new history entry.</p></div><textarea aria-label="Feedback for the implementation plan" maxLength={2000} rows={3} value={planFeedback} onChange={(event) => setPlanFeedback(event.target.value)} placeholder="For example: focus on the backend route and include a regression test step…" disabled={loading} /><div className="plan-feedback-footer"><span>{planFeedback.length}/2,000</span><button className="secondary-button" type="submit" disabled={loading || !planFeedback.trim()}>{loading ? "Revising plan…" : "Revise plan with feedback"}<span>↻</span></button></div></form>
       {approved && <section className="panel-card implementation-card"><div className="panel-heading"><div><h2>Controlled implementation</h2><p>Generate a reviewable patch from this approved plan.</p></div><span className="demo-label">NO COMMANDS RUN</span></div><p className="overview-copy">Agent Lab will prepare up to five file changes. Review every diff below; files are written only after you choose Apply changes.</p>{workspace.implementationBranch && <div className="implementation-branch"><span>ISOLATED GIT BRANCH</span><code>{workspace.implementationBranch}</code></div>}
         {(!draft || draft.status === "stale" || draft.status === "reverted") && <button className="primary-button" onClick={() => void generateDraft()} disabled={draftLoading || !analysisId}>{draftLoading ? "Preparing draft…" : draft?.status === "stale" ? "Regenerate stale draft" : draft?.status === "reverted" ? "Generate a new draft" : "Generate implementation draft"}<span>→</span></button>}
         {draftLoading && (!draft || draft.status === "stale" || draft.status === "reverted") && <p className="draft-note">Reading approved plan and relevant source files…</p>}
@@ -645,14 +947,74 @@ function AnalysisScreen({ apiFetch, workspace, analysisId, draftId, implementati
   </div>;
 }
 
+type GitStatus = {
+  initialized: boolean;
+  branch: string | null;
+  clean: boolean;
+  changes: Array<{ path: string; status: string }>;
+  truncated: boolean;
+  note: string;
+};
+
+function GitStatusScreen({ apiFetch, workspace, onBack }: { apiFetch: ApiFetch; workspace: Workspace; onBack: () => void }) {
+  const [status, setStatus] = useState<GitStatus | null>(null);
+  const [error, setError] = useState("");
+  const apiBase = process.env.NEXT_PUBLIC_API_BASE_URL || "http://localhost:8000";
+
+  useEffect(() => {
+    let cancelled = false;
+    apiFetch(`${apiBase}/api/workspaces/${workspace.id}/git/status`)
+      .then(async (response) => {
+        const payload = await response.json();
+        if (!response.ok) throw new Error(payload.detail || "Could not read Git status.");
+        if (!cancelled) setStatus(payload as GitStatus);
+      })
+      .catch((cause) => { if (!cancelled) setError(cause instanceof Error ? cause.message : "Could not read Git status."); });
+    return () => { cancelled = true; };
+  }, [apiBase, apiFetch, workspace.id]);
+
+  return <div className="screen-stack">
+    <div className="screen-back"><button onClick={onBack}>← {workspace.name}</button><span className="demo-label">READ-ONLY GIT INSPECTION</span></div>
+    <div className="intelligence-title-row"><div><div className="eyebrow"><span className="eyebrow-line" /> GIT WORKSPACE</div><h1 className="screen-title">Git status</h1><p className="screen-subtitle">Inspect the branch and changed paths in this Agent Lab workspace.</p></div></div>
+    {error && <p className="form-error" role="alert">{error}</p>}
+    {!status && !error && <section className="panel-card"><p className="overview-copy">Reading workspace status…</p></section>}
+    {status && <section className="panel-card">
+      <div className="panel-heading"><div><h2>{status.initialized ? status.clean ? "Working tree clean" : `${status.changes.length}${status.truncated ? "+" : ""} changed paths` : "Git baseline not initialized"}</h2><p>{status.initialized ? "Current workspace branch" : "ZIP workspaces get a Git baseline when controlled implementation begins."}</p></div><span className={status.clean ? "ready-pill" : "confidence-pill"}>{status.initialized ? status.clean ? "CLEAN" : "CHANGES" : "NOT INITIALIZED"}</span></div>
+      {status.initialized && <div className="implementation-branch"><span>BRANCH</span><code>{status.branch || "unknown"}</code></div>}
+      <p className="overview-copy">{status.note}</p>
+      {status.changes.length > 0 && <div className="tree-list">{status.changes.map((change) => <div className="tree-row file-path-row" key={`${change.status}:${change.path}`}><span className="file-icon">{change.status}</span><code title={change.path}>{change.path}</code></div>)}</div>}
+      {status.truncated && <p className="overview-note"><span>i</span> Showing the first 200 changed paths.</p>}
+      {status.initialized && status.clean && <p className="intelligence-empty">No tracked or untracked changes were found in this workspace.</p>}
+    </section>}
+  </div>;
+}
+
 type VerificationOptions = { manager: string; status: "ready" | "blocked" | "unsupported"; sandbox_available: boolean; sandbox_reason?: string | null; note: string; checks: Array<{ id: string; label: string; dependency_install?: boolean }>; blocked_checks?: Array<{ label: string; reason: string }> };
 type VerificationResult = { check_id: string; label: string; status: "passed" | "failed"; exit_code: number; output: string; phase?: string };
+
+function verificationDiagnostics(output: string) {
+  const clean = output.replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, "");
+  const lines = clean.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  const diagnosticLines = lines.filter((line) => /\b(error|warning)\b/i.test(line) && !/^\(node:\d+\)/i.test(line));
+  const errors = diagnosticLines.filter((line) => /\berror\b/i.test(line)).length;
+  const warnings = diagnosticLines.filter((line) => /\bwarning\b/i.test(line)).length;
+  return {
+    clean,
+    errors,
+    warnings,
+    lines: diagnosticLines.slice(0, 5),
+    summary: diagnosticLines.length
+      ? `${errors} ${errors === 1 ? "error" : "errors"}${warnings ? ` · ${warnings} ${warnings === 1 ? "warning" : "warnings"}` : ""} found. Start with the file paths and line numbers below.`
+      : "The check failed. Open the command output for the exact build or tool diagnostic.",
+  };
+}
 
 function VerificationScreen({ apiFetch, workspace, onBack }: { apiFetch: ApiFetch; workspace: Workspace; onBack: () => void }) {
   const [options, setOptions] = useState<VerificationOptions | null>(null);
   const [result, setResult] = useState<VerificationResult | null>(null);
   const [error, setError] = useState("");
   const [loadingId, setLoadingId] = useState("");
+  const [copiedOutput, setCopiedOutput] = useState(false);
   const apiBase = process.env.NEXT_PUBLIC_API_BASE_URL || "http://localhost:8000";
 
   useEffect(() => {
@@ -689,17 +1051,35 @@ function VerificationScreen({ apiFetch, workspace, onBack }: { apiFetch: ApiFetc
     }
   }
 
+  async function copyOutput() {
+    if (!result) return;
+    try {
+      await navigator.clipboard.writeText(result.output);
+      setCopiedOutput(true);
+      window.setTimeout(() => setCopiedOutput(false), 1800);
+    } catch {
+      setError("Could not copy the command output. Select and copy it from the details panel instead.");
+    }
+  }
+
   return <>
     <div className="screen-back"><button onClick={onBack}>← {workspace.name}</button><span className="demo-label">CONTROLLED VERIFICATION</span></div>
     <div className="intelligence-title-row"><div><div className="eyebrow"><span className="eyebrow-line" /> TESTING ENGINE</div><h1 className="screen-title">Verify {workspace.name}</h1><p className="screen-subtitle">Only manifest-declared checks from a fixed allowlist are offered.</p></div></div>
     <section className="panel-card"><div className="panel-heading"><div><h2>Available checks</h2><p>Detected project type: {options?.manager || "scanning…"}</p></div><span className="demo-label">DOCKER SANDBOX</span></div>
       <p className="overview-copy">{options?.note || "Inspecting repository manifests…"}</p>
-      {options && !options.sandbox_available && <p className="form-error" role="status">{options.sandbox_reason || "Docker is not available to the API host."} Checks are disabled; repository commands will not run.</p>}
-      {error && <p className="form-error" role="alert">{error}</p>}
+      {options && !options.sandbox_available && <div className="verification-alert" role="status"><span className="verification-alert-icon">!</span><div><strong>Sandbox unavailable</strong><p>{options.sandbox_reason || "Docker is not available to the API host."} Checks are disabled; repository commands will not run.</p></div></div>}
+      {error && <div className="verification-alert error" role="alert"><span className="verification-alert-icon">!</span><div><strong>Could not complete verification</strong><p>{error}</p></div></div>}
       {options?.checks.length ? <div className="project-actions">{options.checks.map((check) => <button className="secondary-button" key={check.id} onClick={() => void runCheck(check)} disabled={!options.sandbox_available || Boolean(loadingId)}>{loadingId === check.id ? "Running…" : check.label}<span>▶</span></button>)}</div> : options?.status === "blocked" ? <p className="form-error" role="status">Detected checks are blocked by package-manager or dependency safety policy. See the specific reasons below.</p> : options && <p className="intelligence-empty">No supported checks were detected from this repository’s manifests.</p>}
-      {options?.blocked_checks?.map((check) => <div className="overview-note" key={`${check.label}:${check.reason}`}><span>!</span> {check.label}: {check.reason}</div>)}
-      {result && <div className="overview-note"><span>{result.status === "passed" ? "✓" : "!"}</span> {result.label}: {result.status} (exit {result.exit_code})</div>}
-      {result && <pre className="verification-output">{result.output}</pre>}
+      {options?.blocked_checks?.map((check) => <div className="verification-blocked-item" key={`${check.label}:${check.reason}`}><span>!</span><div><strong>{check.label}</strong><p>{check.reason}</p></div></div>)}
+      {result && <section className={`verification-result ${result.status}`} aria-live="polite">
+        {(() => { const diagnostics = verificationDiagnostics(result.output); return <>
+        <div className="verification-result-heading"><span className="verification-result-icon">{result.status === "passed" ? "✓" : "×"}</span><div><span className="verification-result-kicker">CHECK {result.status === "passed" ? "PASSED" : "FAILED"}</span><h3>{result.label}</h3></div><span className="verification-exit">Exit code {result.exit_code}</span></div>
+        <p className="verification-result-summary">{result.status === "passed" ? "The command finished successfully." : diagnostics.summary}</p>
+        {result.status === "failed" && diagnostics.lines.length > 0 && <ul className="verification-diagnostics">{diagnostics.lines.map((line, index) => <li key={`${index}:${line}`}><code>{line}</code></li>)}</ul>}
+        {result.phase && <p className="verification-phase">Last phase: <strong>{result.phase}</strong></p>}
+        <details className="verification-log"><summary>Show full command output</summary><button type="button" className="copy-output" onClick={() => void copyOutput()}>{copiedOutput ? "Copied" : "Copy output"}</button><pre className="verification-output">{diagnostics.clean || "The command completed without producing output."}</pre></details>
+        </>; })()}
+      </section>}
       <p className="overview-copy">npm is the only package manager whose locked dependency preparation is currently supported. pnpm, Yarn, and Bun manifests are identified and blocked with a reason rather than being run as npm. Repository checks run without network access.</p>
     </section>
   </>;
