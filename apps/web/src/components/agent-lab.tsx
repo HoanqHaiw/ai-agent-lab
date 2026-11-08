@@ -580,18 +580,34 @@ function SystemStatusScreen({ apiFetch }: { apiFetch: ApiFetch }) {
   useEffect(() => {
     let cancelled = false;
     const apiBase = process.env.NEXT_PUBLIC_API_BASE_URL || "http://localhost:8000";
+    const controller = new AbortController();
+    const timeoutId = window.setTimeout(() => controller.abort(), 75_000);
     setLoading(true);
     setError("");
-    void apiFetch(`${apiBase}/ready`)
+    void apiFetch(`${apiBase}/health`, { signal: controller.signal })
+      .then((healthResponse) => {
+        if (!healthResponse.ok) throw new Error("The API health check failed. Confirm the Render service is live, then retry.");
+        return apiFetch(`${apiBase}/ready`, { signal: controller.signal });
+      })
       .then(async (response) => {
         const payload: unknown = await response.json();
         if (!response.ok && response.status !== 503) throw new Error("The API readiness endpoint could not be read.");
         if (typeof payload !== "object" || payload === null || !("dependencies" in payload)) throw new Error("The API returned an invalid readiness report.");
         if (!cancelled) setReadiness(payload as Readiness);
       })
-      .catch((cause) => { if (!cancelled) setError(cause instanceof Error ? cause.message : "Could not check API readiness."); })
-      .finally(() => { if (!cancelled) setLoading(false); });
-    return () => { cancelled = true; };
+      .catch((cause) => {
+        if (cancelled) return;
+        if (controller.signal.aborted) {
+          setError("The API did not respond within 75 seconds. Render Free may be waking from sleep; wait a little, then retry.");
+        } else {
+          setError(cause instanceof Error ? cause.message : "Could not check API readiness.");
+        }
+      })
+      .finally(() => {
+        window.clearTimeout(timeoutId);
+        if (!cancelled) setLoading(false);
+      });
+    return () => { cancelled = true; controller.abort(); window.clearTimeout(timeoutId); };
   }, [apiFetch, reloadKey]);
 
   const dependencies = readiness?.dependencies || {};
